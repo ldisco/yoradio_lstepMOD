@@ -1,8 +1,0 @@
-data/data/wifi.csv
-.pio/
-.vscode/
-__pycache__/
-*.pyc
-.DS_Store
-Thumbs.db
-build/
