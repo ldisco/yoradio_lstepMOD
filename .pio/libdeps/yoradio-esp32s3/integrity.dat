@@ -1,0 +1,5 @@
+adafruit/Adafruit ILI9341
+https://github.com/moononournation/Arduino_GFX.git
+adafruit/Adafruit GFX Library
+bodmer/TJpg_Decoder @ ^1.0.6
+bblanchon/ArduinoJson @ ^7.2.1

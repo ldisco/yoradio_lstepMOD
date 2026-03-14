@@ -1,0 +1,102 @@
+.pio/build/yoradio-esp32s3/src/src/core/network.cpp.o: \
+ src/src/core/network.cpp src/src/core/options.h \
+ src/src/core/../../myoptions.h src/src/core/../../mytheme.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/libraries/SPI/src/SPI.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/variants/esp32s3/pins_arduino.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/esp32-hal-spi.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/libraries/ESPmDNS/src/ESPmDNS.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/Arduino.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/esp_arduino_version.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/esp8266-compat.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/stdlib_noniso.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/binary.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/extra_attr.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/esp32-hal.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/esp32-hal-log.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/esp32-hal-matrix.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/esp32-hal-uart.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/esp32-hal-gpio.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/esp32-hal-touch.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/esp32-hal-touch-ng.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/esp32-hal-dac.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/esp32-hal-adc.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/esp32-hal-spi.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/esp32-hal-i2c.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/esp32-hal-ledc.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/esp32-hal-rmt.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/esp32-hal-sigmadelta.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/esp32-hal-timer.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/esp32-hal-bt.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/esp32-hal-psram.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/esp32-hal-rgb-led.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/esp32-hal-cpu.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/esp32-hal-hosted.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/WCharacter.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/WString.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/pgmspace.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/Stream.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/Print.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/Printable.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/IPAddress.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/Client.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/Server.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/Udp.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/HardwareSerial.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/HWCDC.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/USBCDC.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/Esp.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/freertos_stats.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/io_pin_remap.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/Arduino.h \
+ src/src/core/rtcsupport.h src/src/core/network.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/libraries/WiFi/src/WiFi.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/Print.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/libraries/WiFi/src/WiFiType.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/libraries/WiFi/src/WiFiSTA.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/libraries/WiFi/src/WiFiGeneric.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/libraries/Network/src/Network.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/libraries/Network/src/NetworkInterface.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/Printable.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/libraries/Network/src/NetworkEvents.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/libraries/Network/src/NetworkManager.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/WString.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/libraries/Network/src/NetworkClient.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/Client.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/libraries/Network/src/NetworkServer.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/Server.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/libraries/Network/src/NetworkUdp.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/Udp.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/cbuf.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/libraries/WiFi/src/WiFiAP.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/libraries/WiFi/src/WiFiScan.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/libraries/WiFi/src/WiFiClient.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/libraries/WiFi/src/WiFiServer.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/libraries/WiFi/src/WiFiUdp.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/libraries/Network/src/NetworkUdp.h \
+ src/src/core/display.h src/src/core/common.h src/src/core/config.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/libraries/LittleFS/src/LittleFS.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/libraries/FS/src/FS.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/libraries/EEPROM/src/EEPROM.h \
+ src/src/core/../displays/widgets/widgetsconfig.h src/src/core/telnet.h \
+ src/src/core/netserver.h \
+ src/src/core/../AsyncWebServer/ESPAsyncWebServer.h \
+ src/src/core/../AsyncWebServer/StringArray.h \
+ src/src/core/../AsyncWebServer/AsyncTCP.h \
+ src/src/core/../AsyncWebServer/WebResponseImpl.h \
+ src/src/core/../AsyncWebServer/WebHandlerImpl.h \
+ src/src/core/../AsyncWebServer/AsyncWebSocket.h \
+ src/src/core/../AsyncWebServer/ESPAsyncWebServer.h \
+ src/src/core/../AsyncWebServer/AsyncWebSynchronization.h \
+ src/src/core/../AsyncWebServer/AsyncEventSource.h src/src/core/player.h \
+ src/src/core/../audioI2S/AudioEx.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/libb64/cencode.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/cores/esp32/esp32-hal-log.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/libraries/SD/src/SD.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/libraries/SD/src/sd_defines.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/libraries/FFat/src/FFat.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/libraries/NetworkClientSecure/src/NetworkClientSecure.h \
+ C:/Users/levba/.platformio/packages/framework-arduinoespressif32/libraries/NetworkClientSecure/src/ssl_client.h \
+ src/src/core/../audioI2S/audiolib_structs.hpp \
+ src/src/core/../audioI2S/psram_unique_ptr.hpp src/src/core/mqtt.h \
+ src/src/core/timekeeper.h \
+ src/src/core/../pluginsManager/pluginsManager.h

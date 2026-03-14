@@ -1,0 +1,362 @@
+    <div id="logo" class="ls">
+    </div>
+    <h2 class="pagetitle" style="padding: 0;">Settings</h2>
+    <div class="navigation group group_system hidden" id="navigation">
+      <div class="navitem group group_system hidden" data-target="group_system">system</div>
+      <div class="navitem group group_display group_nextion hidden" data-target="group_display">screen</div>
+      <div class="navitem group group_controls hidden" data-target="group_controls">controls</div>
+      <div class="navitem group group_timezone hidden" data-target="group_timezone">timezone</div>
+      <div class="navitem group group_wifi hidden" data-target="group_wifi">wifi</div>
+      <div class="navitem group group_weather hidden" data-target="group_weather">weather</div>
+      <div class="navitem group group_system hidden" data-target="group_trackfacts">track facts</div>
+      <div class="navitem group group_system hidden" data-target="group_tools">tools</div>
+    </div>
+    <div id="settingswrap">
+      <div id="settingscontent"><a name="system"></a>
+        <section class="group group_system hidden" id="group_system">
+          <div class="title"><span>system</span></div>
+          <div class="reset" data-name="system" title="reset"></div>
+          <div class="flex-row">
+            <div class="checkbox" id="sst" data-command="smartstart" data-tip="Автозапуск воспроизведения после включения устройства"><div class="knob"></div>Smart Start</div>
+            <div class="checkbox" id="aif" data-command="audioinfo" data-tip="Отображение полосы буфера на экране"><div class="knob"></div>Audio Info</div>
+            <div class="checkbox group group_vu hidden" id="vu" data-command="vumeter" data-tip="Показывать VU-метр громкости на экране устройства"><div class="knob"></div>VU meter</div>
+          </div>
+          <div class="flex-row">
+            <div class="checkbox hidden" id="stao" data-command="sleeptimeralloff" data-tip="Полное отключение питания по таймеру. Требует пин управления питанием (SLEEP_TIMER_PIN). Без SLEEP_TIMER_PIN — простая остановка плеера"><div class="knob"></div>Sleep timer ALL OFF</div>
+          </div>
+          <div class="flex-row">
+            <div class="inputwrap">
+              <span class="inputtitle">soft ap reboot delay (min)</span>
+              <input type="number" id="softr" data-command="softap" value="0" maxlength="2" min="0" max="30" />
+            </div>
+            <div class="inputwrap group group_buffer hidden">
+              <span class="inputtitle">audio buffer size (be careful)</span>
+              <input type="number" id="abuff" data-command="abuff" value="5" maxlength="2" min="5" max="14" />
+            </div>
+            <div class="fb hl local pix group group_buffer hidden" data-command="reboot" title="reboot with new buffer">
+              <svg viewBox="0 0 24 24" class="stroke">
+                <path transform="matrix(1 0 0 -1 0 23)" d="m9 4-5 5 5 5m9 5v-10h-13" fill="none" stroke-width="2"/>
+              </svg>
+            </div>
+          </div>
+          <div class="hr">&nbsp;</div>
+          <div class="flex-row" id="mdnsnamerow">
+            <div class="inputwrap">
+              <span class="inputtitle">mDNS name</span>
+              <input type="text" id="mdns" name="mdnsname" value="" maxlength="24" />
+              <input type="hidden" id="ipaddr" name="ipaddr" value="" />
+            </div>
+            <div class="fb hl local pix" data-command="rebootmdns" title="reboot with new mdns name">
+              <svg viewBox="0 0 24 24" class="stroke">
+                <path transform="matrix(1 0 0 -1 0 23)" d="m9 4-5 5 5 5m9 5v-10h-13" fill="none" stroke-width="2"/>
+              </svg>
+            </div>
+          </div>
+          <div class="flex-row center" id="radiolink" style="font-size: 18px;"></div>
+          <div class="row-title"><span>update</span></div>
+          <div class="flex-row last">
+            <div class="fb local" data-command="fwupdate">Firmware</div>
+            <div class="fb local" data-command="webboard">Board</div>
+          </div> 
+        </section><a name="screen"></a>
+        <section class="group group_display group_oled group_nextion hidden" id="group_display">
+          <div class="title"><span>screen</span></div>
+          <div class="reset" data-name="screen" title="reset"></div>
+          <div class="flex-row">
+            <div class="checkbox group_tft hidden" id="flip" data-command="flipscreen" data-tip="Перевернуть экран на 180°. Полезно при нестандартном монтаже дисплея"><div class="knob"></div>Flip screen</div>
+            <div class="checkbox group_tft hidden" id="inv" data-command="invertdisplay" data-tip="Инвертировать цвета дисплея (негатив). Может помочь с читаемостью для некоторых матриц"><div class="knob"></div>Invert screen</div>
+            <div class="checkbox group_brightness group_oled hidden" id="dspon" data-command="screenon" data-tip="Включить/выключить дисплей. При выключении экран гаснет, но радио продолжает играть"><div class="knob"></div>Turn on</div>
+          </div>
+          <div class="flex-row group group_tft group_oled group_nextion hidden">
+            <div class="checkbox" id="nump" data-command="numplaylist" data-tip="Показывать номера станций в плейлисте на экране устройства"><div class="knob"></div>Numbered Playlist</div>
+          </div>
+          <div class="flex-row group group_brightness hidden">
+            <div class="inputwrap">
+              <span class="inputtitle">brightness</span>
+              <span class="inputinfo" id="slbrightnessinfo">0</span>
+              <input type="range" id="br" data-slaveid="slbrightnessinfo" data-command="brightness" min="0" max="100" value="100">
+            </div>
+          </div>
+          <div class="flex-row group group_nokia hidden">
+            <div class="inputwrap">
+              <span class="inputtitle">contrast</span>
+              <span class="inputinfo" id="slcontrastinfo">0</span>
+              <input type="range" id="con" data-slaveid="slcontrastinfo" data-command="contrast" min="0" max="100" value="55">
+            </div>
+          </div>
+          <div class="row-title"><span>screensaver</span></div>
+          <div class="flex-row group group_tft group_oled group_nextion hidden" style="margin-top:20px;">
+            <div class="inputwrap">
+              <span class="inputtitle">while not playing</span>
+              <div class="checkbox cbwtitle" id="scre" data-command="screensaverenabled"><div class="knob"></div></div>
+            </div>
+            <div class="inputwrap">
+              <span class="inputtitle">blank screen</span>
+              <div class="checkbox cbwtitle" id="scrb" data-command="screensaverblank"><div class="knob"></div></div>
+            </div>
+            <div class="inputwrap">
+              <span class="inputtitle">timeout (sec)</span>
+              <input type="number" id="scrt" data-command="screensavertimeout" value="" maxlength="3" min="5" max="65520" />
+            </div>
+          </div>
+          <div class="flex-row group group_tft group_oled group_nextion hidden">
+            <div class="inputwrap">
+              <span class="inputtitle">while playing</span>
+              <div class="checkbox cbwtitle" id="scrpe" data-command="screensaverplayingenabled"><div class="knob"></div></div>
+            </div>
+            <div class="inputwrap">
+              <span class="inputtitle">blank screen</span>
+              <div class="checkbox cbwtitle" id="scrpb" data-command="screensaverplayingblank"><div class="knob"></div></div>
+            </div>
+            <div class="inputwrap">
+              <span class="inputtitle">timeout (min)</span>
+              <input type="number" id="scrpt" data-command="screensaverplayingtimeout" value="" maxlength="3" min="1" max="1080" />
+            </div>
+          </div>
+        </section><a name="controls"></a>
+        <section class="group group_controls hidden" id="group_controls">
+          <div class="title"><span>Controls</span></div>
+          <div class="reset" data-name="controls" title="reset"></div>
+          <div class="flex-row">
+            <div class="inputwrap">
+              <span class="inputtitle">volume steps</span>
+              <input type="number" id="vols" data-command="volsteps" value="1" maxlength="2" min="1" max="10" />
+            </div>
+            <div class="inputwrap group group_encoder hidden">
+              <span class="inputtitle">encoder acceleration</span>
+              <input type="number" id="enca" data-command="encacc" value="200" maxlength="3" min="0" max="700" />
+            </div>
+          </div>
+          <div class="flex-row group group_touch hidden">
+            <div class="checkbox" id="tsf" data-command="fliptouch" data-tip="Перевернуть координаты тач-панели. Включите, если касания обрабатываются зеркально"><div class="knob"></div>Flip touch</div>
+            <div class="checkbox" id="tsd" data-command="dbgtouch" data-tip="Показывать координаты касаний на экране. Для отладки тач-панели и калибровки зон"><div class="knob"></div>Debug touch</div>
+          </div>
+          <div class="flex-row group group_ir hidden">
+            <div class="inputwrap">
+              <span class="inputtitle">IR tolerance [<a href="https://crankyoldgit.github.io/IRremoteESP8266/doxygen/html/" target="_blank">docs</a>]</span>
+              <input type="number" id="irtl" data-command="irtlp" value="10" maxlength="2" min="10" max="80" />
+            </div>
+          </div>
+          <div class="flex-row">
+            <div class="inputwrap">
+              <div class="checkbox" id="skipup" data-command="oneclickswitching" data-tip="Энкодер переключает станции напрямую (без прокрутки плейлиста). Один щелчок = следующая/предыдущая станция"><div class="knob"></div>one-click station switching</div>
+            </div>
+          </div>
+          <div class="flex-row">
+            <div class="inputwrap">
+              <div class="checkbox" id="favonly" data-command="favonly" data-tip="Кнопки Next/Prev переключают только между избранными (★) станциями, пропуская остальные"><div class="knob"></div>favorites only (next/prev)</div>
+            </div>
+          </div>
+          <div class="flex-row group group_ir last hidden">
+            <div class="fb local" data-command="setupir">IR Recorder</div>
+          </div>
+        </section><a name="timezone"></a>
+        <section class="group group_timezone hidden" id="group_timezone">
+          <div class="title"><span>timezone</span></div>
+          <div class="reset" data-name="timezone" title="reset"></div>
+          <div class="flex-row">
+            <div class="inputwrap">
+              <span class="inputtitle">hours</span>
+              <input type="number" id="tzh" class="textinput" name="tzhour" value="" maxlength="3" min="-12" max="14" />
+            </div>
+            <div class="inputwrap">
+              <span class="inputtitle">minutes</span>
+              <input type="number" id="tzm" class="textinput" name="tzmin" value="" maxlength="2" min="0" max="45" step="15" />
+            </div>
+          </div>
+          <div class="flex-row">
+            <div class="inputwrap">
+              <span class="inputtitle">ntp server #1</span>
+              <input type="text" id="sntp1" class="textinput" name="sntp1" value="" maxlength="34" />
+            </div>
+            <div class="inputwrap">
+              <span class="inputtitle">ntp server #2</span>
+              <input type="text" id="sntp2" class="textinput" name="sntp2" value="" maxlength="34" />
+            </div>
+          </div>
+          <div class="flex-row">
+            <div class="inputwrap group group_wortc hidden">
+              <span class="inputtitle">Sync. interval (min)</span>
+              <input type="number" id="timeint" data-command="timeint" value="" min="15" max="1440" step="1" />
+            </div>
+            <div class="inputwrap group group_rtc hidden">
+              <span class="inputtitle">Sync. interval with RTC (hour)</span>
+              <input type="number" id="timeintrtc" data-command="timeintrtc" value="" min="1" max="168" step="1" />
+            </div>
+          </div>
+          <div class="flex-row last">
+            <div class="fb hl local" data-command="applytz">Apply</div>
+          </div>
+        </section><a name="wifi"></a>
+        <section class="group group_wifi hidden" id="group_wifi">
+          <div class="title"><span>Wi-Fi</span></div>
+          <div class="flex-row credential">
+            <div class="inputwrap">
+              <span class="inputtitle">ssid</span>
+              <input type="text" id="ssid0" class="textinput" name="ssid" value="" maxlength="30" autocomplete="off" />
+            </div>
+            <div class="inputwrap">
+              <span class="inputtitle">pass</span>
+              <input type="text" id="pass0" class="textinput" name="pass" value="" placeholder="**********" maxlength="40" autocomplete="off" readonly="readonly" data-pass="" onfocus="this.removeAttribute('readonly');" />
+            </div>
+          </div>
+          <div class="flex-row credential">
+            <div class="inputwrap">
+              <span class="inputtitle">ssid</span>
+              <input type="text" id="ssid1" class="textinput" name="ssid" maxlength="30" autocomplete="off" />
+            </div>
+            <div class="inputwrap">
+              <span class="inputtitle">pass</span>
+              <input type="text" id="pass1" class="textinput" name="pass" value="" placeholder="**********" maxlength="40" autocomplete="off" readonly="readonly" data-pass="" onfocus="this.removeAttribute('readonly');" />
+            </div>
+          </div>
+          <div class="flex-row credential">
+            <div class="inputwrap">
+              <span class="inputtitle">ssid</span>
+              <input type="text" id="ssid2" class="textinput" name="ssid" value="" maxlength="30" autocomplete="off" />
+            </div>
+            <div class="inputwrap">
+              <span class="inputtitle">pass</span>
+              <input type="text" id="pass2" class="textinput" name="pass" value="" placeholder="**********" maxlength="40" autocomplete="off" readonly="readonly" data-pass="" onfocus="this.removeAttribute('readonly');" />
+            </div>
+          </div>
+          <div class="flex-row credential">
+            <div class="inputwrap">
+              <span class="inputtitle">ssid</span>
+              <input type="text" id="ssid3" class="textinput" name="ssid" value="" maxlength="30" autocomplete="off" />
+            </div>
+            <div class="inputwrap">
+              <span class="inputtitle">pass</span>
+              <input type="text" id="pass3" class="textinput" name="pass" value="" placeholder="**********" maxlength="40" autocomplete="off" readonly="readonly" data-pass="" onfocus="this.removeAttribute('readonly');" />
+            </div>
+          </div>
+          <div class="flex-row credential">
+            <div class="inputwrap">
+              <span class="inputtitle">ssid</span>
+              <input type="text" id="ssid4" class="textinput" name="ssid" value="" maxlength="30" autocomplete="off" />
+            </div>
+            <div class="inputwrap">
+              <span class="inputtitle">pass</span>
+              <input type="text" id="pass4" class="textinput" name="pass" value="" placeholder="**********" maxlength="40" autocomplete="off" readonly="readonly" data-pass="" onfocus="this.removeAttribute('readonly');" />
+            </div>
+          </div>
+          <div class="flex-row last">
+            <input id="file-upload" type="file" accept=".txt, .csv" hidden/>
+            <div class="fb local group group_system hidden" data-command="wifiexport">Export</div>
+            <div class="fb hl local" data-command="wifiupload">Save &amp; Reboot</div>
+          </div>
+        </section><a name="weather"></a>
+        <section class="group group_weather hidden" id="group_weather">
+          <div class="title"><span>Weather</span></div>
+          <div class="reset" data-name="weather" title="reset"></div>
+          <div class="flex-row center">
+            <div class="checkbox" id="wen" data-command="showweather" data-tip="Показывать погоду на экране устройства. Требует настроенного API-ключа OpenWeatherMap"><div class="knob"></div>show weather</div>
+          </div>
+          <div class="flex-row">
+            <div class="inputwrap">
+              <span class="inputtitle">latitude</span>
+              <input type="number" id="wlat" value="" min="-90" max="90" step="0.0001" />
+            </div>
+            <div class="inputwrap">
+              <span class="inputtitle">longitude</span>
+              <input type="number" id="wlon" value="" min="-90" max="90" step="0.0001" />
+            </div>
+          </div>
+          <div class="flex-row">
+            <div class="inputwrap">
+              <span class="inputtitle">openweathermap api key [<a href="https://openweathermap.org/appid" target="_blank">link</a>]</span>
+              <input type="text" id="wkey" value="" />
+            </div>
+          </div>
+          <div class="flex-row">
+            <div class="inputwrap">
+              <span class="inputtitle">Sync. interval (min)</span>
+              <input type="number" id="wint" data-command="wint" value="" min="15" max="1440" step="1" />
+            </div>
+          </div>
+          <div class="flex-row last">
+            <div class="fb hl local" data-command="applyweather">Apply</div>
+          </div>
+        </section>
+        <a name="trackfacts"></a>
+        <section class="group group_system hidden" id="group_trackfacts">
+          <div class="title"><span>Track Facts (AI)</span></div>
+          <div class="reset" data-name="trackfacts" title="reset"></div>
+          <div class="flex-row center">
+            <div class="checkbox" id="tfen" data-command="trackfactsenabled" data-tip="Показывать факты о треке через AI. Требует настроенного провайдера и API-ключа"><div class="knob"></div>enable track facts</div>
+          </div>
+          <div class="flex-row">
+            <div class="inputwrap">
+              <span class="inputtitle">provider</span>
+              <select id="tfprovider" data-command="trackfactsprovider" onchange="updateKeyDesc()">
+                <option value="0">Google Gemini Flash</option>
+                <option value="1">DeepSeek AI</option>
+                <option value="2">iTunes Search (Default)</option>
+                <option value="3">Last.fm (Relay)</option>
+                <option value="4">MusicBrainz (Relay)</option>
+              </select>
+            </div>
+          </div>
+          <div class="flex-row">
+            <div class="inputwrap">
+              <span class="inputtitle">google gemini api key [<a href="https://aistudio.google.com/" target="_blank">get free key</a>]</span>
+              <input type="text" id="tfkey" value="" placeholder="AIzaSyBxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" />
+            </div>
+          </div>
+          <div class="flex-row">
+            <div class="inputwrap">
+              <span class="inputtitle">language</span>
+              <select id="tflang" data-command="trackfactslang">
+                <option value="0">Русский</option>
+                <option value="1">English</option>
+                <option value="2">Auto</option>
+              </select>
+            </div>
+            <div class="inputwrap">
+              <span class="inputtitle">facts per track</span>
+              <input type="number" id="tfcount" data-command="trackfactscount" value="3" min="1" max="5" step="1" />
+            </div>
+          </div>
+          <div class="flex-row last">
+            <div class="fb hl local" data-command="applytrackfacts">Apply</div>
+          </div>
+        </section>
+        <a name="tools"></a>
+        <section class="group group_system hidden" id="group_tools">
+          <div class="title"><span>Tools</span></div>
+          <div class="flex-row">
+            <div class="checkbox" id="telnet" data-command="telnet" data-tip="Управление через Telnet (порт 23). Полезно для отладки и команд прямо через терминал"><div class="knob"></div>Telnet server</div>
+            <div class="checkbox" id="watchdog" data-command="watchdog" data-tip="Автоматически перезапускает аудио при зависании или потере потока"><div class="knob"></div>Audio watchdog</div>
+          </div>
+          <div class="hr">&nbsp;</div>
+          <div id="fsinfo" style="font-size: 13px; color: var(--main-hl-color); margin: 5px 0 10px 0; text-align: center;">...</div>
+          <div class="flex-row center" style="margin-top: 8px;">
+            <div class="fb tool local" data-command="filemanager" title="File Manager">file manager</div>
+          </div>
+          <div class="flex-row center" style="margin-top: 14px;">
+            <div class="fb hl tool local" data-command="reboot" title="Reboot ESP">reboot</div>
+            <div class="fb tool local" data-command="format" title="Format LITTLEFS">format</div>
+            <div class="fb tool local" data-command="reset" title="Reset settings">reset</div>
+          </div>
+        </section>
+      </div>
+    </div><!--playerwrap-->
+    <div class="fb done group group_system hidden" data-name="settingsdone" id="settingsdone">done</div>
+    <div id="copy">powered by <a target="_blank" href="https://github.com/e2002/yoradio/">ёRadio</a><span id="version"></span></div>
+
+    <!-- Модальный диалог файлового менеджера -->
+    <div id="fmdialog" style="display:none">
+      <div id="fmdialog-header">
+        <span id="fm-title">File Manager</span>
+        <span id="fm-close" onclick="toggleFileManager()">&times;</span>
+      </div>
+      <div id="fm-breadcrumb"></div>
+      <div id="fm-filelist"></div>
+      <div id="fm-upload">
+        <input type="file" id="fm-file-input" />
+        <div class="fb tool" onclick="fmUpload()">upload</div>
+      </div>
+      <div id="fm-status"></div>
+    </div>
+    <div id="fm-overlay" style="display:none" onclick="toggleFileManager()"></div>
+    
