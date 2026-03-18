@@ -1,0 +1,5 @@
+![ESP32-S3](https://img.shields.io/badge/Hardware-ESP32--S3_N16R8-orange.svg)
+![Core](https://img.shields.io/badge/Arduino_Core-v3.x-red.svg)
+![PlatformIO](https://img.shields.io/badge/Build-PlatformIO_(pioarduino)-blue.svg)
+![Filesystem](https://img.shields.io/badge/FS-LittleFS-lightgrey.svg)
+![Upstream](https://img.shields.io/badge/Based_on-e2002/yoradio_v0.9.720-green.svg)
