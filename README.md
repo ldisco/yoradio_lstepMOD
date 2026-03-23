@@ -34,15 +34,16 @@
 ![4](https://github.com/user-attachments/assets/68b41f33-75f1-4470-bd31-73f89aca1a47)
 ![5](https://github.com/user-attachments/assets/f08a428c-8c05-4b23-b8e5-f79bf41d436e)
 
+### 🧠 Плагин TrackFacts (AI-факты)
+Вывод интересных фактов о текущей композиции. Поддерживаются разные провайдеры (выбираются в WebUI). 
+* *Рекомендация:* В реалиях РФ стабильнее всего работают **DeepSeek** и **iTunes**. Gemini и MusicBrainz подвержены сетевым блокировкам (работают в основном через VPN/VPS).
+
 ![6](https://github.com/user-attachments/assets/9366009a-a9b2-4d1c-8439-60a55b63f0a9)
 
 ![7](https://github.com/user-attachments/assets/3f4afe24-2d42-457a-9ae2-23a86a2a838f)
 
 <img width="551" height="822" alt="8" src="https://github.com/user-attachments/assets/240372a7-7203-44d8-808e-174cc9330c49" />
 
-### 🧠 Плагин TrackFacts (AI-факты)
-Вывод интересных фактов о текущей композиции. Поддерживаются разные провайдеры (выбираются в WebUI). 
-* *Рекомендация:* В реалиях РФ стабильнее всего работают **DeepSeek** и **iTunes**. Gemini и MusicBrainz подвержены сетевым блокировкам (работают в основном через VPN/VPS).
 
 ### ⚙️ Ядро и Аудио
 * **Переработанный Watchdog и SmartStart:** Логика восстановления потока и автостарта написана с нуля.
@@ -53,4 +54,18 @@
 ---
 
 ## 🛠 Установка и сборка
+Проект собирается через **PlatformIO** (`pioarduino`). 
+
+1. Клонируйте репозиторий:
+   ```bash
+   git clone [https://github.com/ldisco/yoradio_lstepMOD.git](https://github.com/ldisco/yoradio_lstepMOD.git)
+   
+2. Откройте в VS Code / Cursor или Trae с плагином PlatformIO.
+
+3. Настройте myoptions.h (пины, тип дисплея, параметры I2S DAC). Хотя мод заточен под дисплей NV3041A, сохранена универсальность — реализована работа ILI9488 в портретном режиме.
+
+4. Соберите и прошейте проект (Upload).
+
+5. Для работы WebUI загрузите LittleFS: Upload Filesystem Image, предварительно разместив в папке yoradio_lstepMOD\data\data свои данные wifi.csv и свой playlist.csv.
+
 
