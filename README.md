@@ -68,4 +68,6 @@
 
 5. Для работы WebUI загрузите LittleFS: Upload Filesystem Image, предварительно разместив в папке yoradio_lstepMOD\data\data свои данные wifi.csv и свой playlist.csv.
 
+> **Для Arduino IDE:** [отдельный репозиторий](https://github.com/ldisco/yoradio_lstepMOD_arduino)
+
 
