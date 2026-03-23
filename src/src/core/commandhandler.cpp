@@ -52,17 +52,14 @@ bool CommandHandler::exec(const char *command, const char *value, uint8_t cid) {
   /****************** WEBSOCKET ****************/
   /*********************************************/
   if (strEquals(command, "getindex"))  {
-    // Помимо стандартных данных индекса сразу отправляем состояние таймера сна,
-    // чтобы кнопка на главном экране отрисовалась без ожидания следующего тика.
+    // Важно: не отправляем websocket.textAll() напрямую из контекста WS-команды
+    // (через sleepTimerPlugin.pushState), чтобы не ловить реэнтерабельные подвисания.
     netserver.requestOnChange(GETINDEX, cid);
-    sleepTimerPlugin.pushState();
     return true;
   }
 
   if (strEquals(command, "getsystem"))  {
-    // Аналогично для страницы SYSTEM: сразу отдаем состояние/доступность ALL OFF.
     netserver.requestOnChange(GETSYSTEM, cid);
-    sleepTimerPlugin.pushState();
     return true;
   }
   if (strEquals(command, "getscreen"))  { netserver.requestOnChange(GETSCREEN, cid); return true; }
@@ -77,6 +74,7 @@ bool CommandHandler::exec(const char *command, const char *value, uint8_t cid) {
   if (strEquals(command, "fliptouch"))    { config.saveValue(&config.store.fliptouch, static_cast<bool>(atoi(value))); flipTS(); return true; }
   if (strEquals(command, "dbgtouch"))     { config.saveValue(&config.store.dbgtouch, static_cast<bool>(atoi(value))); return true; }
   if (strEquals(command, "flipscreen"))   { config.saveValue(&config.store.flipscreen, static_cast<bool>(atoi(value))); display.flip(); display.putRequest(NEWMODE, CLEAR); display.putRequest(NEWMODE, PLAYER); return true; }
+  if (strEquals(command, "displaycover")) { setDisplayCoversEnabled(static_cast<bool>(atoi(value))); netserver.requestOnChange(GETSCREEN, cid); return true; }
   if (strEquals(command, "brightness"))   { if (!config.store.dspon) netserver.requestOnChange(DSPON, 0); config.saveValue(&config.store.brightness, static_cast<uint8_t>(atoi(value)), false); config.setBrightness(true); return true; }
   if (strEquals(command, "screenon"))     { config.setDspOn(static_cast<bool>(atoi(value))); return true; }
   if (strEquals(command, "contrast"))     { config.saveValue(&config.store.contrast, static_cast<uint8_t>(atoi(value))); display.setContrast(); return true; }
@@ -209,13 +207,6 @@ bool CommandHandler::exec(const char *command, const char *value, uint8_t cid) {
       Serial.println("[CMD] applytrackfacts received placeholder, ignoring key update");
       return true;
     }
-    Serial.printf("[CMD] applytrackfacts received key length=%d\n", strlen(value));
-    Serial.printf("[CMD] applytrackfacts value='%s'\n", value);
-    Serial.printf("[CMD] applytrackfacts value HEX: ");
-    for(int i=0; i<strlen(value) && i<50; i++) {
-      Serial.printf("%02X ", (unsigned char)value[i]);
-    }
-    Serial.println();
     config.setGeminiApiKey(value);
     trackFactsPlugin.setGeminiApiKey(config.store.geminiApiKey);
     return true; 
@@ -228,9 +219,19 @@ bool CommandHandler::exec(const char *command, const char *value, uint8_t cid) {
     // [v0.4.2] Ручной запрос факта из WebUI. 
     // [FIX] Если TrackFacts выключен — игнорируем запрос
     if (!trackFactsPlugin.isEnabled()) return true;
-    // Даем пользователю подтверждение, что запрос принят, даже если сейчас пауза.
-    trackFactsPlugin.requestManualFact();
-    trackFactsPlugin.sendStatus("Запрос факта принят. Ожидание...");
+    // [FIX] Показываем подтверждение только если запрос РЕАЛЬНО поставлен в очередь.
+    // Если факт уже есть в RAM/файловом кэше — не спамим всплывающим "ожидание...".
+    String rejectReason;
+    if (trackFactsPlugin.requestManualFact(&rejectReason)) {
+      trackFactsPlugin.sendStatus("Запрос факта принят. Ожидание...");
+    } else if (rejectReason.length() > 0 &&
+               rejectReason.indexOf("уже доступен") < 0 &&
+               rejectReason.indexOf("из файлового кэша") < 0 &&
+               rejectReason.indexOf("уже выполняется") < 0) {
+      // Отправляем красный toast только для реального отказа запуска.
+      // Информационные причины ("уже есть факт"/"уже выполняется") не считаем ошибкой.
+      trackFactsPlugin.sendStatus(rejectReason.c_str(), true);
+    }
     return true;
   }
   

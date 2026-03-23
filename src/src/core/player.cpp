@@ -130,7 +130,7 @@ void Player::_stop(bool alreadyStopped){
       // При ошибке подключения (_hasError) обновляем MODE в UI.
       if (_hasError) netserver.requestOnChange(MODE, 0);
     } else {
-      
+      // Пользователь нажал Стоп — фиксируем wasPlaying=false, чтобы SmartStart не стартовал после перезагрузки.
       config.saveValue(&config.store.wasPlaying, false);
       stopInfo();
     }
@@ -170,11 +170,24 @@ void Player::loop() {
         if (requestP.payload>0) {
           config.setLastStation((uint16_t)requestP.payload);
         }
-        _play((uint16_t)abs(requestP.payload)); 
-        if (player_on_station_change) player_on_station_change(); 
+        _play((uint16_t)abs(requestP.payload), false);
+        if (player_on_station_change) player_on_station_change();
         pluginsManager::getInstance().on_station_change();
         break;
       }
+      #ifdef USE_SD
+      case PR_PLAY_SD: {
+        // Переход WEB→SD: грузим из SD-плейлиста без опоры на getMode() (гонка кэшей Core 0/1).
+        config.store.play_mode = PM_SDCARD;
+        if (requestP.payload > 0) {
+          config.setLastStation((uint16_t)requestP.payload);
+        }
+        _play((uint16_t)abs(requestP.payload), true);
+        if (player_on_station_change) player_on_station_change();
+        pluginsManager::getInstance().on_station_change();
+        break;
+      }
+      #endif
       case PR_TOGGLE: {
         toggle();
         break;
@@ -186,11 +199,22 @@ void Player::loop() {
       }
       #ifdef USE_SD
       case PR_CHECKSD: {
-        if(config.getMode()==PM_SDCARD){
-          if(!sdman.cardPresent()){
-            sdman.stop();
-            config.changeMode(PM_WEB);
+        // Дебаунс: переключаем на WEB только после нескольких подряд отсутствий карты,
+        // чтобы не срабатывать на кратковременные глюки детекции (и не «выкидывать» из SD при клике по треку).
+        static uint8_t sdAbsentCount = 0;
+        if (config.getMode() == PM_SDCARD) {
+          if (!sdman.cardPresent()) {
+            if (sdAbsentCount < 255) sdAbsentCount++;
+            if (sdAbsentCount >= 3) {
+              sdAbsentCount = 0;
+              sdman.stop();
+              config.changeMode(PM_WEB);
+            }
+          } else {
+            sdAbsentCount = 0;
           }
+        } else {
+          sdAbsentCount = 0;
         }
         break;
       }
@@ -233,29 +257,38 @@ void Player::setOutputPins(bool isPlaying) {
   if(MUTE_PIN!=255) digitalWrite(MUTE_PIN, _ml);
 }
 
-void Player::_play(uint16_t stationId) {
+void Player::_play(uint16_t stationId, bool forceSDPlaylist) {
   log_i("%s called, stationId=%d", __func__, stationId);
   _hasError=false;
   setDefaults();
   _status = STOPPED;
   setOutputPins(false);
   remoteStationName = false;
-  
-  if(!config.prepareForPlaying(stationId)) return;
+
+  // При PR_PLAY_SD выставляем режим SD до prepareForPlaying, чтобы configPostPlaying сохранил lastSdStation.
+  if (forceSDPlaylist) config.store.play_mode = PM_SDCARD;
+
+  if(!config.prepareForPlaying(stationId, forceSDPlaylist)) return;
   _loadVol(config.store.volume);
-  
+
+  // Окно STATION_SWITCH_SSL_BLOCK_MS: не запускать HTTPS обложки/факты сразу после старта веб-станции
+  // (иначе mbedTLS конкурирует с FLAC/WebSocket и даёт -32512 SSL OOM при фрагментированной куче).
+  if (config.getMode() == PM_WEB) {
+    g_stationSwitchTime = millis();
+  }
+
   bool isConnected = false;
-  if(config.getMode()==PM_SDCARD && SDC_CS!=255){
+  if((config.getMode()==PM_SDCARD || forceSDPlaylist) && SDC_CS!=255){
     isConnected=connecttoFS(sdman,config.station.url,config.sdResumePos==0?_resumeFilePos:config.sdResumePos-player.sd_min);
   }else {
-    config.saveValue(&config.store.play_mode, static_cast<uint8_t>(PM_WEB));
+    if (!forceSDPlaylist) config.saveValue(&config.store.play_mode, static_cast<uint8_t>(PM_WEB));
   }
   connproc = false;
   if(config.getMode()==PM_WEB) isConnected=connecttohost(config.station.url);
   connproc = true;
   if(isConnected){
     _status = PLAYING;
-    if(config.getMode() == PM_WEB) g_lastWebStreamActivityMs = millis(); // Watchdog: метка старта потока
+    if(config.getMode() == PM_WEB) g_lastWebStreamActivityMs = millis();
     config.configPostPlaying(stationId);
     setOutputPins(true);
     if (player_on_start_play) player_on_start_play();

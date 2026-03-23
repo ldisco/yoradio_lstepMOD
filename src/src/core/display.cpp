@@ -84,6 +84,42 @@ void returnPlayer(){
   display.putRequest(NEWMODE, PLAYER);
 }
 
+// Возвращает реальный размер входного буфера плеера (в байтах).
+// Используется как 100% для расчёта процента и цвета полосы — так значение совпадает с диагностикой [DIAG] buf=filled/total.
+static uint32_t getPlayerBufferMaxForUi() {
+  uint32_t size = player.getInBufferSize();
+  return size ? size : 1UL;  // защита от деления на ноль
+}
+
+// Переводит текущее заполнение буфера в процент 0..100.
+static uint8_t calcBufferPercent(uint32_t currentValue) {
+  const uint32_t maxValue = getPlayerBufferMaxForUi();
+  if (maxValue == 0) return 0;
+
+  uint32_t percent = (currentValue * 100UL) / maxValue;
+  if (percent > 100UL) percent = 100UL;
+  return static_cast<uint8_t>(percent);
+}
+
+// Локальный перевод RGB888 в RGB565.
+// Делаем отдельной функцией здесь, чтобы не обращаться к приватному Config::color565().
+static uint16_t toRgb565(uint8_t r, uint8_t g, uint8_t b) {
+  // Укладываем 8-битные компоненты в формат 5-6-5:
+  // R -> старшие 5 бит, G -> средние 6 бит, B -> младшие 5 бит.
+  return ((static_cast<uint16_t>(r) & 0xF8) << 8)
+       | ((static_cast<uint16_t>(g) & 0xFC) << 3)
+       |  (static_cast<uint16_t>(b) >> 3);
+}
+
+// Выбирает цвет индикатора буфера для дисплея по тем же порогам, что и в WebUI:
+// 0-15% -> красный, 15-50% -> жёлтый, 50-100% -> зелёный.
+static uint16_t getBufferColorForDisplay(uint32_t currentValue) {
+  const uint8_t percent = calcBufferPercent(currentValue);
+  if (percent <= 15) return toRgb565(255, 63, 47);
+  if (percent <= 50) return toRgb565(242, 203, 47);
+  return toRgb565(57, 217, 100);
+}
+
 Display::~Display() {
   delete _pager;
   delete _footer;
@@ -163,16 +199,26 @@ void Display::_bootScreen(){
       lineHeight = CHARHEIGHT;
     }
 
+#if DSP_MODEL==DSP_ILI9488 || DSP_MODEL==DSP_ILI9486
+    // ILI9488/ILI9486: строка версии на 4 px ниже строки «Соединяюсь с…» (после первой строки текста).
+    constexpr uint16_t BOOT_VER_GAP_PX = 4;
+#else
+    constexpr uint16_t BOOT_VER_GAP_PX = 0;
+#endif
+    const uint16_t verTopPrefer = (uint16_t)(bootstrConf.top + lineHeight + BOOT_VER_GAP_PX);
+
     // Предпочтительно размещаем строку ВЕРСИИ НИЖЕ основной boot-строки,
     // если это не выводит текст за пределы экрана.
-    if ((uint16_t)(bootstrConf.top + 2 * lineHeight) < dsp.height()) {
-      bootverConfLocal.top = (uint16_t)(bootstrConf.top + lineHeight);
+    if ((uint16_t)(verTopPrefer + lineHeight) < dsp.height()) {
+      bootverConfLocal.top = verTopPrefer;
     } else {
       // Если ниже места нет — сдвигаем строку версии ВЫШЕ на одну строку,
+      // чтобы она оставалась в пределах видимой области.
       if (bootstrConf.top > lineHeight) {
         bootverConfLocal.top = (uint16_t)(bootstrConf.top - lineHeight);
       } else {
         // Совсем маленький дисплей: оставляем ту же координату,
+
         bootverConfLocal.top = bootstrConf.top;
       }
     }
@@ -237,7 +283,8 @@ void Display::_buildPager(){
     _volbar = new SliderWidget(volbarConf, config.theme.volbarin, config.theme.background, 100, config.theme.volbarout);
   #endif
   #ifndef HIDE_HEAPBAR
-    _heapbar = new SliderWidget(heapbarConf, config.theme.buffer, config.theme.background, psramInit()?300000:1600 * config.store.abuff);
+    // Начальный max — запасной; при первом обновлении вызовется setMax(player.getInBufferSize()).
+    _heapbar = new SliderWidget(heapbarConf, config.theme.buffer, config.theme.background, 655350UL);
   #endif
   #ifndef HIDE_VOL
     _voltxt = new TextWidget(voltxtConf, 10, false, config.theme.vol, config.theme.background);
@@ -548,7 +595,16 @@ void Display::loop() {
             } 
           }
           break;
-        case AUDIOINFO: if(_heapbar)  { _heapbar->lock(!config.store.audioinfo); _heapbar->setValue(player.inBufferFilled()); } break;
+        case AUDIOINFO:
+          if(_heapbar)  {
+            _heapbar->lock(!config.store.audioinfo);
+            const uint32_t bufFilled = player.inBufferFilled();
+            // 100% = реальный размер буфера (как в [DIAG] buf=filled/total).
+            _heapbar->setMax(getPlayerBufferMaxForUi());
+            _heapbar->setColor(getBufferColorForDisplay(bufFilled));
+            _heapbar->setValue(bufFilled);
+          }
+          break;
         case SHOWVUMETER: {
           if(_vuwidget){
             // [FIX] VU показывается если: настройка включена И player играет
@@ -590,7 +646,15 @@ void Display::loop() {
           if(_mode == SDCHANGE) _nums->setText(request.payload, "%d");
           break;
         }
-        case DSPRSSI: if(_rssi){ _setRSSI(request.payload); } if (_heapbar && config.store.audioinfo) _heapbar->setValue(player.isRunning()?player.inBufferFilled():0); break;
+        case DSPRSSI:
+          if(_rssi){ _setRSSI(request.payload); }
+          if (_heapbar && config.store.audioinfo) {
+            const uint32_t bufFilled = player.isRunning() ? player.inBufferFilled() : 0;
+            _heapbar->setMax(getPlayerBufferMaxForUi());
+            _heapbar->setColor(getBufferColorForDisplay(bufFilled));
+            _heapbar->setValue(bufFilled);
+          }
+          break;
         case PSTART: _layoutChange(true);   break;
         case PSTOP:  _layoutChange(false);  break;
         case DSP_START: _start();  break;
@@ -651,21 +715,39 @@ char *split(char *str, const char *delim) {
 }
 
 void Display::_title() {
-  if (strlen(config.station.title) > 0) {
-    char tmpbuf[strlen(config.station.title)+1];
-    strlcpy(tmpbuf, config.station.title, strlen(config.station.title)+1);
-    char *stitle = split(tmpbuf, " - ");
+  // [FIX][BOOTLOOP][SD] Во время boot-этапа (_bootStep < 2) заголовочные виджеты плеера
+  // ещё не инициализированы через _buildPager(), и вызов _title1->setText(...) может
+  // обращаться к неинициализированным внутренним буферам ScrollWidget.
+  // Это приводило к StoreProhibited в strlcpy()/svfprintf при индексации SD на старте.
+  // Поэтому до полного старта экрана плеера просто пропускаем перерисовку title.
+  if (_bootStep < 2 || !_title1) return;
+
+  // [FIX][BOOTLOOP][SD] Делаем атомарный "снимок" заголовка в локальный буфер фиксированного размера.
+  // Это убирает риск работы с изменяемой строкой config.station.title во время перерисовки дисплея.
+  // Дополнительно не используем VLA (переменный массив на стеке), чтобы исключить нестабильность стека
+  // в display task на старте/индексации SD.
+  char titleSnapshot[BUFLEN];
+  memset(titleSnapshot, 0, sizeof(titleSnapshot));
+  strlcpy(titleSnapshot, config.station.title, sizeof(titleSnapshot));
+
+  if (titleSnapshot[0] != '\0') {
+    // [FIX][BOOTLOOP][SD] Разделяем "Artist - Title" только на копии,
+    // чтобы не модифицировать исходный буфер config.station.title.
+    char splitBuf[BUFLEN];
+    memset(splitBuf, 0, sizeof(splitBuf));
+    strlcpy(splitBuf, titleSnapshot, sizeof(splitBuf));
+
+    char *stitle = split(splitBuf, " - ");
     if(stitle && _title2){
-      _title1->setText(tmpbuf);
+      _title1->setText(splitBuf);
       _title2->setText(stitle);
     }else{
-      _title1->setText(config.station.title);
+      _title1->setText(titleSnapshot);
       if(_title2) _title2->setText("");
     }
     /*#ifdef USE_NEXTION
-      nextion.newTitle(config.station.title);
+      nextion.newTitle(titleSnapshot);
     #endif*/
-    
   }else{
     _title1->setText("");
     if(_title2) _title2->setText("");

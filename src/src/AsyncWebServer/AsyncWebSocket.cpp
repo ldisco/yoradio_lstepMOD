@@ -37,6 +37,9 @@
 #define MAX_PRINTF_LEN 64
 
 size_t webSocketSendFrameWindow(AsyncClient *client){
+  // После _onDisconnect() указатель AsyncClient обнуляется; без проверки — LoadProhibited в _runQueue().
+  if(!client)
+    return 0;
   if(!client->canSend())
     return 0;
   size_t space = client->space();
@@ -46,6 +49,8 @@ size_t webSocketSendFrameWindow(AsyncClient *client){
 }
 
 size_t webSocketSendFrame(AsyncClient *client, bool final, uint8_t opcode, bool mask, uint8_t *data, size_t len){
+  if(!client)
+    return 0;
   if(!client->canSend())
     return 0;
   size_t space = client->space();
@@ -499,6 +504,8 @@ AsyncWebSocketClient::~AsyncWebSocketClient(){
 }
 
 void AsyncWebSocketClient::_onAck(size_t len, uint32_t time){
+  if(!_client)
+    return;
   _lastMessageTime = millis();
   if(!_controlQueue.isEmpty()){
     auto head = _controlQueue.front();
@@ -521,6 +528,8 @@ void AsyncWebSocketClient::_onAck(size_t len, uint32_t time){
 }
 
 void AsyncWebSocketClient::_onPoll(){
+  if(!_client)
+    return;
   if(_client->canSend() && (!_controlQueue.isEmpty() || !_messageQueue.isEmpty())){
     _runQueue();
   } else if(_keepAlivePeriod > 0 && _controlQueue.isEmpty() && _messageQueue.isEmpty() && (millis() - _lastMessageTime) >= _keepAlivePeriod){
@@ -529,6 +538,8 @@ void AsyncWebSocketClient::_onPoll(){
 }
 
 void AsyncWebSocketClient::_runQueue(){
+  if(!_client)
+    return;
   while(!_messageQueue.isEmpty() && _messageQueue.front()->finished()){
     _messageQueue.remove(_messageQueue.front());
   }
@@ -548,6 +559,10 @@ bool AsyncWebSocketClient::queueIsFull(){
 void AsyncWebSocketClient::_queueMessage(AsyncWebSocketMessage *dataMessage){
   if(dataMessage == NULL)
     return;
+  if(!_client){
+    delete dataMessage;
+    return;
+  }
   if(_status != WS_CONNECTED){
     delete dataMessage;
     return;
@@ -566,6 +581,10 @@ void AsyncWebSocketClient::_queueMessage(AsyncWebSocketMessage *dataMessage){
 void AsyncWebSocketClient::_queueControl(AsyncWebSocketControl *controlMessage){
   if(controlMessage == NULL)
     return;
+  if(!_client){
+    delete controlMessage;
+    return;
+  }
   _controlQueue.add(controlMessage);
   if(_client->canSend())
     _runQueue();
@@ -605,7 +624,8 @@ void AsyncWebSocketClient::_onError(int8_t){}
 
 void AsyncWebSocketClient::_onTimeout(uint32_t time){
   (void)time;
-  _client->close(true);
+  if(_client)
+    _client->close(true);
 }
 
 void AsyncWebSocketClient::_onDisconnect(){
@@ -644,7 +664,14 @@ void AsyncWebSocketClient::_onData(void *pbuf, size_t plen){
     }
 
     const size_t datalen = std::min((size_t)(_pinfo.len - _pinfo.index), plen);
-    const auto datalast = data[datalen];
+    // Some event handlers might treat the payload as a C-string and temporarily
+    // write a '\0' at data[datalen]. However, when the frame chunk ends exactly at
+    // the end of the provided buffer (datalen == plen), touching data[datalen] is
+    // out-of-bounds and can corrupt the heap. Only read/restore when we know the
+    // backing buffer has at least one extra byte.
+    const bool canRestore = datalen < plen;
+    uint8_t datalast = 0;
+    if (canRestore) datalast = data[datalen];
 
     if(_pinfo.masked){
       for(size_t i=0;i<datalen;i++)
@@ -695,8 +722,8 @@ void AsyncWebSocketClient::_onData(void *pbuf, size_t plen){
       break;
     }
 
-    // restore byte as _handleEvent may have added a null terminator i.e., data[len] = 0;
-    if (datalen > 0)
+    // Restore the byte as _handleEvent may have added a null terminator.
+    if (canRestore && datalen > 0)
       data[datalen] = datalast;
 
     data += datalen;

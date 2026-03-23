@@ -140,6 +140,9 @@ class SliderWidget: public Widget {
     using Widget::init;
     void init(FillConfig conf, uint16_t fgcolor, uint16_t bgcolor, uint32_t maxval, uint16_t oucolor=0);
     void setValue(uint32_t val);
+    void setColor(uint16_t fgcolor);
+    /** Задаёт максимум для расчёта ширины полосы (0.._max → 0..width). Нужно для полосы буфера, где 100% = реальный размер буфера. */
+    void setMax(uint32_t maxval);
   protected:
     uint16_t _height, _oucolor, _oldvalwidth;
     uint32_t _max, _value;

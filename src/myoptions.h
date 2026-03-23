@@ -22,6 +22,30 @@
 //#define BITRATE_FULL      false     /* Значек битрейта. По умолчанию "true" */ 
 #define L10N_LANGUAGE RU    /*  Language (EN, RU). More info in yoRadio/locale/displayL10n_(en|ru).h*/
 
+
+// [DIAG] в Serial: только если 1. Для #if нельзя писать false — используйте 0 или закомментируйте строку.
+#define AUDIO_STREAM_DIAG 0
+// Возвращаем поведение чтения WEB-потока ближе к "как раньше":
+// отключаем экспериментальный HEAP-GUARD, который при пороге 80KB
+// часто пропускал чтение сокета и провоцировал фризы/просадки буфера.
+// Если строку закомментировать — в options.h снова станет true (по умолчанию ВКЛ).
+#define AUDIO_READ_HEAP_GUARD_ENABLE false
+// Строка [HEAP-GUARD] в мониторе (0/1). На саму защиту (пропуск чтения + delay) не влияет.
+// #define AUDIO_READ_HEAP_GUARD_LOG 1
+/*временный диагностический мониторинг потока и сети, чтобы по логам понять, что чаще виновато в фризах: сеть, сам поток или код.
+выводится раз в 5 секунд (в Serial и telnet)
+Одна строка в формате:
+
+##AUDIO.INFO#: [DIAG] buf=12345/655349 1% slow=150 lost=0 netAvail=8192 heap=108000 rssi=-62
+Расшифровка:
+buf — заполнение буфера в байтах и его полный размер.
+% — заполнение буфера в процентах (низкий % при фризах → буфер часто пустеет).
+slow — сколько раз за последнюю секунду буфер был ниже одного блока (чем больше, тем чаще «медленный» поток и риск дропаутов).
+lost — счётчик секунд без данных от сети (рост до 10 → «Stream lost» и реконнект).
+netAvail — сколько байт было доступно от сети в момент последнего вызова (0 при пустом буфере → сеть не успевает; большое значение при пустом буфере → узкое место скорее декодер/код).
+heap — свободная куча (резкие просадки могут совпадать с фризами).
+rssi — уровень WiFi в dBm (слабее −70…−80 при фризах намекает на сеть).*/
+
 // WebUI: показывать обложки для WEB и SD режимов.
 // true  - включено (ID3 из SD + iTunes, как в веб-радио)
 // false - отключено (в вебе всегда logo)
@@ -29,13 +53,44 @@
 
 // Логи блокировки SSL (cooldown/heap/SD и т.д.).
 // false - скрыть периодические сообщения в мониторе.
-#define SSL_BLOCK_LOG_ENABLE false
+#define SSL_BLOCK_LOG_ENABLE true
+
+// HTTPS: суммарный free heap + отдельно MIN_MAX_ALLOC_HEAP_FOR_SSL (см. options.h).
+// (-32512) при freeHeap 60–70K = фрагментация: смотреть getMaxAllocHeap в логах блокировки.
+// Runtime (FLAC+iTunes+cover): max≈31.7K при free≈54K — порог 32768/52000 резал всё подряд.
+#define MIN_HEAP_FOR_SSL_FACTS 44000
+#define MIN_HEAP_FOR_SSL_COVERS 44000
+// Непрерывный блок под mbedTLS; 30K достаточно для типичного рукопожатия при фрагментации ~31K max.
+#define MIN_MAX_ALLOC_HEAP_FOR_SSL 30000
+
+// TrackFacts: мин. заполнение аудио-буфера (%) перед SSL (в options.h по умолчанию 8).
+// В 0.8.92 этого процента вообще не было — факты стартовали чаще, но при просадке буфера сильнее били по стабильности.
+// 6% — мягкий компромисс: меньше ложных «низкий буфер», защита от фризов сохраняется.
+// Закомментируй строку — вернётся дефолт 8 из options.h.
+#define MIN_AUDIO_BUFFER_FOR_SSL_FACTS_PERCENT 6
 
 // Отображение обложек на дисплее (TFT).
 #define DISPLAY_COVERS_ENABLE true
 
-#define COVER_DOWNLOAD_DELAY_MS 1500
+// 2000 мс как в options.h по умолчанию: при FLAC+Facts чуть больше времени до TLS обложки после старта потока.
+#define COVER_DOWNLOAD_DELAY_MS 2000
 #define DISPLAY_COVER_REFRESH_MS 1500
+
+// Лимиты файлового кэша обложек/фактов.
+// Если оставить как есть или удалить строки, сработают дефолты из options.h/TrackFacts.h.
+#define COVER_CACHE_MAX_BYTES (5 * 1024 * 1024)
+// #define LITTLEFS_MIN_FREE_BYTES (2 * 1024 * 1024)
+#define FACTS_CACHE_MAX_BYTES (2 * 1024 * 1024) // Сейчас задаётся в TrackFacts.h
+
+// Жёсткое окно блокировки SSL после переключения станции (мс).
+// Выведено в myoptions для удобства тюнинга; текущее дефолтное значение 20000.
+#define STATION_SWITCH_SSL_BLOCK_MS 20000
+
+// TrackFacts: автозапрос AI-фактов (ручной запрос по нажатию остаётся доступен всегда).
+// true  - авто-режим как сейчас
+// false - только ручной запрос
+#define TRACKFACTS_AUTO_GEMINI_ENABLE true
+#define TRACKFACTS_AUTO_DEEPSEEK_ENABLE false
 
 // ===== Sleep Timer (аппаратное отключение питания) =====
 // Если оставить 255, таймер сна будет работать только программно (без обесточивания).
@@ -74,45 +129,46 @@
 
 /* Display */
 //#define DSP_MODEL     DSP_DUMMY
-#define DSP_MODEL         DSP_NV3041A
+//#define DSP_MODEL         DSP_NV3041A
 //#define DSP_MODEL    DSP_ST7735  /* Select ST7735*/
 //#define DTYPE     INITR_GREENTAB  /*  ST7735 display submodel. По умолчанию "INITR_BLACKTAB" */
 //#define DSP_MODEL    DSP_ILI9341 /* Select ILI9341*/
 //#define DSP_MODEL   DSP_ST7789  /* Select ST7789*/
 //#define DSP_MODEL   DSP_ST7789_170  /* Select ST7789x170*/
-//#define DSP_MODEL    DSP_ILI9488 /* Select ILI9488*/
+#define DSP_MODEL    DSP_ILI9488 /* Select ILI9488*/
+#define ILI9488_PORTRAIT true
 //#define DSP_MODEL    DSP_ST7796 /* Select ILI9486*/
 //#define DSP_MODEL    DSP_SSD1306x32    /* Select SSD1306-128х32*/
 //#define DSP_MODEL    DSP_SH1106    /* Select SH1106-128х64*/
 
 // Пины для параллельного интерфейса NV3041A (плата JC4827W543)
-#define TFT_CS  45
-#define TFT_RST -1
-#define TFT_SCK 47
-#define TFT_D0 21
-#define TFT_D1 48
-#define TFT_D2 40
-#define TFT_D3 39
-#define TFT_DC 255
+///#define TFT_CS  45
+///#define TFT_RST -1
+///#define TFT_SCK 47
+///#define TFT_D0 21
+///#define TFT_D1 48
+///#define TFT_D2 40
+///#define TFT_D3 39
+///#define TFT_DC 255
 
 // Управление яркостью
-#define GFX_BL 1 
-#define BRIGHTNESS_PIN  GFX_BL    /* (FSPI WP)    can be BLK, BL - Pin for brightness (output 0 - 3v3) */
+///#define GFX_BL 1 
+//#define BRIGHTNESS_PIN  GFX_BL    /* (FSPI WP)    can be BLK, BL - Pin for brightness (output 0 - 3v3) */
 
 /*  CAPACITIVE TOUCHSCREEN  Раскомментировать, если используется. */
-#define  TS_MODEL   TS_MODEL_GT911
+///#define  TS_MODEL   TS_MODEL_GT911
 //for JC4827W543 (NV3041A)
 /*  Capacitive I2C touch screen  */
-#define TS_SDA      8    
-#define TS_SCL      4       
-#define TS_INT      3    
-#define TS_RST      38
+/// #define TS_SDA      8    
+///#define TS_SCL      4       
+///#define TS_INT      3    
+///#define TS_RST      38
 
 /* TFT */
-//#define TFT_CS          7    /* (FSPI CS0)        can be CS pin ( ) */
-//#define TFT_RST         -1    /* SPI RST pin. (-1 if connect to EN) */
-//#define TFT_DC           9    /* (FSPI HD)         can be DC, RS */
-//#define BRIGHTNESS_PIN  255   /* (FSPI WP)    can be BLK, BL - Pin for brightness (output 0 - 3v3) */
+#define TFT_CS          10    /* (FSPI CS0)        can be CS pin ( ) */
+#define TFT_RST         -1    /* SPI RST pin. (-1 if connect to EN) */
+#define TFT_DC           9    /* (FSPI HD)         can be DC, RS */
+#define BRIGHTNESS_PIN  3   /* (FSPI WP)    can be BLK, BL - Pin for brightness (output 0 - 3v3) */
 					/* Connect TFT_MOSI  to pin  11     (FSPI D)      can be SDA, DIN, SDI */
 					/* Connect TFT_SCLK  to pin  12     (FSPI CLK)   can be SCL, SCK, CLK */
 /* **************************************** */
@@ -124,9 +180,12 @@
   #define I2S_BCLK      5    /*  = BCLK Bit clock */
   #define I2S_LRC       6    /*  = WSEL Left Right Clock */
 #else
-  #define I2S_DOUT      16    /*  = DIN connection. Should be set to 255 if the board is not used */
-  #define I2S_BCLK      7    /*  = BCLK Bit clock */
-  #define I2S_LRC       15    /*  = WSEL Left Right Clock */
+  //#define I2S_DOUT      16    /*  = DIN connection. Should be set to 255 if the board is not used */
+  //#define I2S_BCLK      7    /*  = BCLK Bit clock */
+  //#define I2S_LRC       15    /*  = WSEL Left Right Clock */
+  #define I2S_DOUT      17    /*  = DIN connection. Should be set to 255 if the board is not used */
+  #define I2S_BCLK      16    /*  = BCLK Bit clock */
+  #define I2S_LRC       18    /*  = WSEL Left Right Clock */
 #endif
 /* **************************************** */
 
@@ -153,25 +212,26 @@
 /* **************************************** */
 
 /*  ENCODERs  */
-//#define ENC_BTNL              1       /*  Левое вращение энкодера (S1, DT)*/
-//#define ENC_BTNR              2       /*  Правое вращение энкодера (S2, CLK) */
-//#define ENC_BTNB              42       /*  Кнопка энкодера (Key, SW)*/
+#define ENC_BTNL              4       /*  Левое вращение энкодера (S1, DT)*/
+#define ENC_BTNR              5       /*  Правое вращение энкодера (S2, CLK) */
+#define ENC_BTNB              8       /*  Кнопка энкодера (Key, SW)*/
 //#define ENC2_BTNL             6       /*  Левое вращение энкодера-2 (S1, DT)*/
 //#define ENC2_BTNR             5       /*  Правое вращение энкодера-2 (S2, CLK) */
 //#define ENC2_BTNB             4       /*  Кнопка энкодера-2 (Key, SW)*/
- #define ENC_INTERNALPULLUP    false    /*  Enable the weak pull up resistors. По умолчанию "true"  */
- #define ENC2_INTERNALPULLUP   false    /*  Enable the weak pull up resistors. По умолчанию "true"  */
+/// #define ENC_INTERNALPULLUP    false    /*  Enable the weak pull up resistors. По умолчанию "true"  */
+///
+//  #define ENC2_INTERNALPULLUP   false    /*  Enable the weak pull up resistors. По умолчанию "true"  */
 
 /*  SDCARD  */
-#define SD_MAX_LEVELS      10     /* Глубина рекурсии по папкам SD (оригинал: 3) */
+#define SD_MAX_LEVELS      6     /* Глубина рекурсии по папкам SD (оригинал: 3) */
 // #define SDC_CS          39      /* SDCARD CS pin */
 					// Connect SDC_MOSI to  40  /* On board can be D1 pin */
 					// Connect SDC_SCK to   41   /* On board can be CLK pin */
 					// Connect SDC_MISO to  42  /* On board can be D0 pin */
 // #define SD_SPIPINS  41, 42, 40    /* SCK, MISO, MOSI */
-#define SDC_CS        10        /* SDCARD CS pin */
-#define SD_SPIPINS  12, 13, 11      /* SCK, MISO, MOSI */
-#define SD_HSPI     true      /* use HSPI for SD (miso=12, mosi=13, clk=14) instead of VSPI (by default)  */
+////#define SDC_CS        10        /* SDCARD CS pin */
+////#define SD_SPIPINS  12, 13, 11      /* SCK, MISO, MOSI */
+////#define SD_HSPI     true      /* use HSPI for SD (miso=12, mosi=13, clk=14) instead of VSPI (by default)  */
 /* **************************************** */
 
 

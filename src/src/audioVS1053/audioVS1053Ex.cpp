@@ -7,6 +7,9 @@
    Author: Wolle (Dec 15.2023), easy
  ****************************************************************************************/
 #include "../core/options.h"
+#if AUDIO_STREAM_DIAG
+#include <WiFi.h>
+#endif
 
 #if I2S_DOUT==255
 #include "../core/config.h"
@@ -4610,7 +4613,7 @@ bool Audio::parseHttpResponseHeader() { // this is the response to a GET / reque
             icyLogo.trim();
             if(icyLogo.strlen() > 0){
                 AUDIO_INFO("icy-logo: %s", icyLogo.get());
-//                info(evt_icylogo, icyLogo.get());
+                if(audio_icylogo) audio_icylogo(icyLogo.get());
             }
         }
 
@@ -4684,7 +4687,7 @@ bool Audio::parseHttpResponseHeader() { // this is the response to a GET / reque
         else if(rhl.starts_with_icase("icy-url:")) {
             char* icyurl = (rhl.get() + 8);
             trim(icyurl);
-//            /*info(evt_icyurl,*/ audio_icyurl(icyurl);
+            if(audio_icyurl) audio_icyurl(icyurl);
         }
 
         else if(rhl.starts_with_icase("www-authenticate:")) {
@@ -5735,6 +5738,12 @@ uint32_t Audio::inBufferFilled() {
     return InBuff.bufferFilled();
 }
 //###################################################################
+uint32_t Audio::getInBufferSize() {
+    // Возвращаем полный размер входного буфера (в байтах),
+    // чтобы внешние модули могли корректно считать процент заполнения.
+    return InBuff.getBufsize();
+}
+//###################################################################
 /*uint32_t Audio::inBufferFree() {
     // current audio input buffer free space in bytes
     return InBuff.freeSpace();
@@ -6244,6 +6253,26 @@ exit:
 //##################################################################
 boolean Audio::streamDetection(uint32_t bytesAvail) {
     if(!m_lastHost.valid()) {AUDIO_ERROR("m_lastHost is empty"); return false;}
+
+#if AUDIO_STREAM_DIAG
+    // Периодический вывод диагностики потока/сети в монитор (раз в 5 сек) для поиска причины фризов.
+    {
+        static uint32_t lastDiag = 0;
+        uint32_t now = millis();
+        if(lastDiag == 0 || now - lastDiag >= 5000) {
+            lastDiag = now;
+            size_t filled = InBuff.bufferFilled();
+            size_t total = InBuff.getBufsize();
+            unsigned pct = total ? (unsigned)((uint64_t)filled * 100 / total) : 0;
+            int rssi = -255;
+            if(WiFi.status() == WL_CONNECTED) rssi = WiFi.RSSI();
+            AUDIO_INFO("[DIAG] buf=%u/%u %u%% slow=%u lost=%u netAvail=%u heap=%lu rssi=%d",
+                (unsigned)filled, (unsigned)total, pct,
+                (unsigned)m_sdet.cnt_slow, (unsigned)m_sdet.cnt_lost,
+                (unsigned)bytesAvail, (unsigned long)ESP.getFreeHeap(), rssi);
+        }
+    }
+#endif
 
     // if within one second the content of the audio buffer falls below the size of an audio frame 100 times,
     // issue a message

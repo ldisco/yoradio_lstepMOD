@@ -69,8 +69,21 @@ FactResult GeminiProvider::fetchFact(const String& artist, const String& title) 
   String requestBody;
   serializeJson(requestDoc, requestBody);
 
-  Serial.printf("[Gemini] Free Heap before SSL: %u\n", ESP.getFreeHeap());
+  Serial.printf("[Gemini] Free Heap after JSON build: %u\n", ESP.getFreeHeap());
 
+  {
+    uint32_t t0 = millis();
+    while (!isSafeForSSLForFacts() && (millis() - t0) < 4000) {
+      delay(50);
+    }
+  }
+  if (!isSafeForSSLForFacts()) {
+    result.errorMsg = "SSL not safe (pre-POST)";
+    Serial.printf("[Gemini] Aborted before begin: unsafe heap/safety, heap=%u\n", ESP.getFreeHeap());
+    return result;
+  }
+
+  Serial.println("[Gemini] http.begin()...");
   if (!http.begin(client, url)) {
     result.errorMsg = "Unable to begin HTTP connection";
     Serial.println("[Gemini] Unable to begin HTTP connection");
@@ -79,17 +92,15 @@ FactResult GeminiProvider::fetchFact(const String& artist, const String& title) 
 
   http.addHeader("Content-Type", "application/json");
   http.addHeader("Accept", "application/json");
-  http.setTimeout(8000);  // 8 секунд HTTP таймаут
-  http.setConnectTimeout(5000);  // [FIX] 5 секунд лимит на TCP-подключение
+  http.setTimeout(18000);
+  http.setConnectTimeout(8000);
 
-  // [FIX] Проверяем безопасность SSL перед POST
-  if (!isSafeForSSLForFacts()) {
-    http.end();
-    result.errorMsg = "SSL not safe (pre-POST)";
-    return result;
-  }
+  Serial.printf("[Gemini] POST start, body=%u bytes, heap=%u\n",
+                static_cast<unsigned>(requestBody.length()), ESP.getFreeHeap());
 
   int httpCode = http.POST(requestBody);
+
+  Serial.printf("[Gemini] POST done, httpCode=%d, heap=%u\n", httpCode, ESP.getFreeHeap());
 
   if (httpCode <= 0) {
     result.errorMsg = "Connection failed: " + http.errorToString(httpCode) + " (" + String(httpCode) + ")";

@@ -48,7 +48,7 @@ extern __attribute__((weak)) void audio_showstreamtitle(const char*);
 //extern __attribute__((weak)) void audio_showstation(const char*);
 extern __attribute__((weak)) void audio_bitrate(const char*);
 extern __attribute__((weak)) void audio_icyurl(const char*);
-//extern __attribute__((weak)) void audio_icylogo(const char*);
+extern __attribute__((weak)) void audio_icylogo(const char*);
 extern __attribute__((weak)) void audio_icydescription(const char*);
 extern __attribute__((weak)) void audio_lasthost(const char*);
 extern __attribute__((weak)) void audio_eof_stream(const char*); // The webstream comes to an end
@@ -194,8 +194,8 @@ class Audio{
     bool           eofHeader;
     void           setDefaults(); // free buffers and set defaults
     uint32_t     inBufferFilled();            // returns the number of stored bytes in the inputbuffer
+    uint32_t     getInBufferSize();            // returns the size of the inputbuffer in bytes (для расчёта % при порогах SSL)
 //    uint32_t     inBufferFree();              // returns the number of free bytes in the inputbuffer
-//    uint32_t     getInBufferSize();           // returns the size of the inputbuffer in bytes
 //    bool         setInBufferSize(size_t mbs); // sets the size of the inputbuffer in bytes
     void         setTone(int8_t gainLowPass, int8_t gainBandPass, int8_t gainHighPass);
     void         setI2SCommFMT_LSB(bool commFMT);

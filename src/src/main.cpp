@@ -53,6 +53,7 @@ static void playerTask(void* arg) {
     vTaskDelay(pdMS_TO_TICKS(1));
   }
 }
+
 #if USE_OTA
 void setupOTA(){
   char safeHost[MDNS_LENGTH] = {0};
@@ -205,8 +206,13 @@ void setup() {
       player.sendCommand({PR_PLAY, (int)st});
     }
   }
+  // Задача плеера на core 0: поток может блокироваться — тогда виснет только плеер, веб/тач (core 1) работают.
   xTaskCreatePinnedToCore(playerTask, "PlayerTask", PLAYER_TASK_STACK, NULL, PLAYER_TASK_PRIO, NULL, PLAYER_TASK_CORE);
   pluginsManager::getInstance().on_end_setup();
+
+  // Приоритет loop() не поднимаем: vTaskPrioritySet(2) на core 1 давал ощутимые побочные эффекты
+  // в связке с дисплеем/сетью. Защита от ложного FREEZE — в timekeeper (стрим + таймаут) и
+  // низкий приоритет CoverDL/FactsTask (0).
 }
 
 #include "core/audiohandlers.h"
@@ -220,6 +226,7 @@ void loop() {
   #ifdef NETSERVER_LOOP1
   netserver.loop();
   #endif
+
   timekeeper.loop1();
   telnet.loop();
 
@@ -234,10 +241,20 @@ void loop() {
   // если после "[соединение]" долго нет тега, подменяем его на имя станции.
   config.updateConnectTitleFallback();
 
+  // player.loop() вынесен в playerTask (core 0) — главный цикл не блокируется на потоке, веб/тач всегда отзывчивы.
 #if USE_OTA
   if (network.status == CONNECTED || network.status==SDREADY)
     ArduinoOTA.handle();
 #endif
+
+  // [FIX] В SD при потере WiFi reconnect перенесён из обработчика события в main loop,
+  // чтобы избежать перезагрузки (вызов WiFi.reconnect() из контекста события при разрыве
+  // сокетов приводил к rst:0xc). Выполняем с задержкой ~1.5 с после sdReconnectAfterMs.
+  if (network.status == SDREADY && network.sdReconnectAfterMs != 0 && millis() >= network.sdReconnectAfterMs) {
+    network.sdReconnectAfterMs = 0;
+    Serial.println("[WIFI] SD mode: deferred reconnect");
+    WiFi.reconnect();
+  }
 
   // [FIX] WiFi health-check: если WiFi потерян и не восстановился за 30 сек,
   // принудительно reconnect. Спасает от зависания при микро-помехах
@@ -288,6 +305,7 @@ void loop() {
 
   // [FIX] Auto-retry: если стрим упал с ошибкой (smartstart остался 1),
   // пробуем переподключиться с нарастающей задержкой (5→10→20→40→40 сек).
+
   {
     static uint32_t lastRetryMs = 0;
     static uint8_t  retryCount  = 0;
@@ -305,6 +323,14 @@ void loop() {
       if (now - lastRetryMs >= delayMs) {
         lastRetryMs = now;
         retryCount++;
+        if (retryCount == 3) {
+          // После трёх неудачных попыток считаем, что мог «залипнуть» WiFi/DNS.
+          // Выполняем мягкий перезапуск WiFi без стирания сохранённых сетей:
+          Serial.println("[RETRY] 3 fails in a row, restarting WiFi stack");
+          WiFi.disconnect(false);
+          delay(100);
+          WiFi.reconnect();
+        }
         if (retryCount <= 5) {
           Serial.printf("[RETRY] Auto-retry #%d, delay was %lu ms\n", retryCount, delayMs);
           player.sendCommand({PR_PLAY, config.lastStation()});

@@ -211,6 +211,23 @@ void TouchScreen::loop(){
             #endif
             if (inTopBar) {
               playMode_e next = (config.getMode() == PM_WEB) ? PM_SDCARD : PM_WEB;
+              {
+                FILE* f = fopen("debug-0da86f.log", "a");
+                if (f) {
+                  // #region agent log
+                  fprintf(
+                    f,
+                    "{\"sessionId\":\"0da86f\",\"runId\":\"run1\",\"hypothesisId\":\"H5\",\"location\":\"touchscreen.cpp:topbar_tap\",\"message\":\"top bar touch requested mode switch\",\"data\":{\"touchY\":%u,\"height\":%u,\"nextMode\":%d,\"currentMode\":%d},\"timestamp\":%lu}\n",
+                    (unsigned)_oldTouchY,
+                    (unsigned)_height,
+                    (int)next,
+                    (int)config.getMode(),
+                    (unsigned long)millis()
+                  );
+                  // #endregion
+                  fclose(f);
+                }
+              }
               scheduleChangeModeTask((int)next);
             } else
 #endif

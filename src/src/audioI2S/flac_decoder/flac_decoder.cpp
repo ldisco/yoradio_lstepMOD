@@ -38,6 +38,9 @@ float            s_flacCompressionRatio = 0;
 uint8_t          s_flacBitBufferLen = 0;
 bool             s_f_flacParseOgg = false;
 bool             s_f_bitReaderError = false;
+// Флаг «ошибка bitreader уже залогирована в текущем аварийном эпизоде».
+// Нужен, чтобы при деградации FLAC-потока не засыпать Serial тысячами одинаковых строк.
+bool             s_f_bitReaderErrorLogged = false;
 uint8_t          s_flac_pageSegments = 0;
 ps_ptr<char>     s_flacStreamTitle = {};
 ps_ptr<char>     s_flacVendorString = {};
@@ -128,6 +131,9 @@ void FLACDecoder_setDefaults(){
     s_f_flacNewMetadataBlockPicture = false;
     s_f_flacParseOgg = false;
     s_f_bitReaderError = false;
+    // Сбрасываем одноразовый флаг логирования при полном сбросе состояния декодера.
+    // Это позволяет в следующем независимом эпизоде снова вывести одну диагностическую строку.
+    s_f_bitReaderErrorLogged = false;
     s_nBytes = 0;
 }
 //----------------------------------------------------------------------------------------------------------------------
@@ -140,13 +146,33 @@ const uint32_t mask[] = {0x00000000, 0x00000001, 0x00000003, 0x00000007, 0x00000
                          0x0fffffff, 0x1fffffff, 0x3fffffff, 0x7fffffff, 0xffffffff};
 
 uint32_t readUint(uint8_t nBits, int32_t *bytesLeft){
+    // Если ранее уже зафиксирован underflow bitreader, выходим немедленно.
+    // Это жестко обрывает каскад повторных чтений и защищает монитор порта от log-storm.
+    if (s_f_bitReaderError) {
+        return 0;
+    }
     while (s_flacBitBufferLen < nBits){
         uint8_t temp = *(s_flacInptr + s_rIndex);
         s_rIndex++;
         (*bytesLeft)--;
-        if(*bytesLeft < 0) { FLAC_LOG_ERROR("error in bitreader"); s_f_bitReaderError = true; break;}
+        if(*bytesLeft < 0) {
+            // Логируем причину только один раз на эпизод ошибки.
+            // Без этого на плохих FLAC-станциях шли десятки тысяч одинаковых сообщений.
+            if (!s_f_bitReaderErrorLogged) {
+                FLAC_LOG_ERROR("error in bitreader");
+                s_f_bitReaderErrorLogged = true;
+            }
+            // Помечаем глобальную ошибку bitreader и прекращаем чтение.
+            s_f_bitReaderError = true;
+            break;
+        }
         s_flac_bitBuffer = (s_flac_bitBuffer << 8) | temp;
         s_flacBitBufferLen += 8;
+    }
+    // Если выйти из цикла из-за ошибки или данных все равно недостаточно — возвращаем 0 без побочных эффектов.
+    // Важно: не выполняем вычитание s_flacBitBufferLen -= nBits, чтобы не получить отрицательное переполнение.
+    if (s_f_bitReaderError || s_flacBitBufferLen < nBits) {
+        return 0;
     }
     s_flacBitBufferLen -= nBits;
     uint32_t result = s_flac_bitBuffer >> s_flacBitBufferLen;
@@ -191,10 +217,18 @@ void FLACDecoderReset(){ // set var to default
 int32_t FLACFindSyncWord(unsigned char *buf, int32_t nBytes) {
 
     int32_t i = FLAC_specialIndexOf(buf, "OggS", nBytes);
-    if(i == 0) {s_f_bitReaderError = false; return 0;}  // flag has ogg wrapper
+    if(i == 0) {
+        // Найдена корректная синхронизация Ogg-страницы: снимаем аварийные флаги bitreader.
+        // Это переводит декодер в «чистое» состояние и разрешает один новый диагностический лог при следующей ошибке.
+        s_f_bitReaderError = false;
+        s_f_bitReaderErrorLogged = false;
+        return 0;
+    }  // flag has ogg wrapper
 
     if(s_f_oggWrapper && i > 0){
+        // При успешной ресинхронизации внутри уже активного Ogg-потока также сбрасываем аварийные флаги.
         s_f_bitReaderError = false;
+        s_f_bitReaderErrorLogged = false;
         return i;
     }
     else{

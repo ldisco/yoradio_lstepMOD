@@ -14,6 +14,7 @@
 extern volatile bool g_modeSwitching;
 // Watchdog: время последней активности веб-потока (обновляется из audio_stream_activity)
 extern volatile uint32_t g_lastWebStreamActivityMs;
+// Сердцебиение главного цикла (core 1). Если долго не обновляется — считаем зависание, делаем WiFi reconnect без перезагрузки.
 extern volatile uint32_t g_mainLoopHeartbeatMs;
 
 #ifdef USE_NEXTION
@@ -105,21 +106,32 @@ bool TimeKeeper::loop0(){ // core0 (display)
     //HEAP_INFO();
   }
 
-  // [FIX] Восстановление при зависании главного цикла
+  // [FIX] Проверка зависания главного цикла.
+  // Перезагрузка ТОЛЬКО если main loop не обновлялся >60 с И аудио-стрим тоже мёртв.
+  // Если стрим активен (g_lastWebStreamActivityMs свежий), значит устройство работает,
+  // а main loop просто заблокирован на lwIP-мьютексе из-за параллельного SSL-запроса —
+  // это временная ситуация, и перезагрузка только ухудшит UX.
   static uint32_t _lastFreezeCheckMs = 0;
-  static uint32_t _lastFreezeRecoveryMs = 0; // когда в последний раз делали reconnect
-  if (currentTime - _lastFreezeCheckMs >= 15000) { // проверяем не чаще чем раз в 15 сек
+  static uint32_t _lastFreezeRecoveryMs = 0;
+  if (currentTime - _lastFreezeCheckMs >= 15000) {
     _lastFreezeCheckMs = currentTime;
+    uint32_t loopAge = currentTime - g_mainLoopHeartbeatMs;
+    uint32_t streamAge = currentTime - g_lastWebStreamActivityMs;
     if (WiFi.status() == WL_CONNECTED &&
-        (currentTime - g_mainLoopHeartbeatMs) > 35000 &&
-        (currentTime - _lastFreezeRecoveryMs) > 120000) { // не чаще одного раза в 2 мин
+        loopAge > 60000 &&
+        streamAge > 60000 &&
+        (currentTime - _lastFreezeRecoveryMs) > 120000) {
       _lastFreezeRecoveryMs = currentTime;
-      Serial.println("[FREEZE-RECOVERY] Main loop stuck >35s, reconnecting WiFi (no reboot)");
-      WiFi.disconnect(false);
-      delay(100);
-      WiFi.reconnect();
+      Serial.printf("[FREEZE-RECOVERY] Main loop stuck %lus, stream silent %lus — rebooting\n",
+                    (unsigned long)(loopAge / 1000),
+                    (unsigned long)(streamAge / 1000));
+      delay(50);
+      ESP.restart();
     }
+    // НЕ логируем «почти зависание» из loop0(): это та же задача дисплея (core 0), что и плеер —
+    // Serial.printf здесь блокирует CPU/UART и даёт щелчки/артефакты в звуке.
   }
+
   return true; // just in case
 }
 
@@ -129,6 +141,7 @@ bool TimeKeeper::loop1(){ // core1 (player)
   static uint32_t _last2s = 0;
   if (currentTime - _last1s >= 1000) { // 1sec
     pluginsManager::getInstance().on_ticker();
+    resumeDeferredCoverDownload(); // отложенная обложка после окна станции / когда Facts SSL освободился
     _last1s = currentTime;
 //#ifndef DUMMYDISPLAY
 #if !defined(DUMMYDISPLAY) || defined(USE_NEXTION)

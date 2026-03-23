@@ -32,7 +32,8 @@
 #define COLOR_DATE               255, 255, 255  /* date */
 #define COLOR_HEAP               255, 168, 162  /* heap */
 #define COLOR_BUFFER             41, 255, 55    /* buffer */
-#define COLOR_IP                 231, 211, 90   /* IP address */
+//#define COLOR_IP                 231, 211, 90   /* IP address */
+#define COLOR_IP                 131, 99, 157  /* IP address */
 #define COLOR_VOLUME_VALUE       41, 189, 207   /* volume value */
 #define COLOR_RSSI               0, 70, 255     /* RSSI */
 #define COLOR_VOLBAR_OUT         255, 255, 0    /* volume bar outline */

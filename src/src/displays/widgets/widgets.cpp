@@ -149,7 +149,9 @@ void ScrollWidget::init(const char* separator, ScrollConfig conf, uint16_t fgcol
 
 void ScrollWidget::_setTextParams() {
   if (_config.textsize == 0) return;
-  if(_fb->ready()){
+  // [FIX][STABILITY] Проверяем _fb на nullptr перед ready():
+  // на конфигурациях без PSFBUFFER буфер может не создаваться.
+  if(_fb && _fb->ready()){
   #ifdef PSFBUFFER
     _fb->setTextSize(_config.textsize);
     _fb->setTextColor(_fgcolor, _bgcolor);
@@ -165,23 +167,41 @@ bool ScrollWidget::_checkIsScrollNeeded() {
 }
 
 void ScrollWidget::setText(const char* txt) {
+  // [FIX][BOOTLOOP][SD] Жёсткая защита входа:
+  // 1) txt может прийти как nullptr при гонке/сбое источника меты;
+  // 2) внутренние буферы должны быть валидны до любых операций форматирования.
+  if (!_text || !_oldtext || _buffsize < 2) return;
+  if (!txt) txt = "";
+
+  // [FIX][BOOTLOOP][SD] Сначала копируем вход в локальный буфер фиксированного размера.
+  // Это защищает от изменения исходного указателя во время конвертации utf8Rus()
+  // и не даёт читать "живой" внешний буфер напрямую.
+  char localTxt[BUFLEN];
+  memset(localTxt, 0, sizeof(localTxt));
+  strlcpy(localTxt, txt, sizeof(localTxt));
+
   // Аналогично TextWidget::setText: NV3041A имеет собственную реализацию utf8Rus в DspCore,
   // все остальные модели используют общую функцию utf8Rus().
+  const char* converted = "";
 #if DSP_MODEL==DSP_NV3041A
-  strlcpy(_text, dsp.utf8Rus(txt, _uppercase), _buffsize - 1);
+  converted = dsp.utf8Rus(localTxt, _uppercase);
 #else
-  strlcpy(_text, utf8Rus(txt, _uppercase), _buffsize - 1);
+  converted = utf8Rus(localTxt, _uppercase);
 #endif
+  if (!converted) converted = "";
+  strlcpy(_text, converted, _buffsize);
   if (strcmp(_oldtext, _text) == 0) return;
   _textwidth = strlen(_text) * _charWidth;
-  _x = _fb->ready()?0:_config.left;
+  // [FIX][STABILITY] Единый флаг готовности кадрового буфера с проверкой nullptr.
+  const bool fbReady = (_fb && _fb->ready());
+  _x = fbReady ? 0 : _config.left;
   _doscroll = _checkIsScrollNeeded();
   if (dsp.getScrollId() == this) dsp.setScrollId(NULL);
   _scrolldelay = millis();
   if (_active) {
     _setTextParams();
     if (_doscroll) {
-      if(_fb->ready()){
+      if(fbReady){
       #ifdef PSFBUFFER
         _fb->fillRect(0, 0, _width, _textheight, _bgcolor);
         _fb->setCursor(0, 0);
@@ -198,7 +218,7 @@ void ScrollWidget::setText(const char* txt) {
         dsp.clearClipping();
       }
     } else {
-      if(_fb->ready()){
+      if(fbReady){
       #ifdef PSFBUFFER
         _fb->fillRect(0, 0, _width, _textheight, _bgcolor);
         _fb->setCursor(_realLeft(true), 0);
@@ -226,7 +246,8 @@ void ScrollWidget::setText(const char* txt, const char *format){
 void ScrollWidget::loop() {
   if(_locked) return;
   if (!_doscroll || _config.textsize == 0 || (dsp.getScrollId() != NULL && dsp.getScrollId() != this)) return;
-  uint16_t fbl = _fb->ready()?0:_config.left;
+  const bool fbReady = (_fb && _fb->ready());
+  uint16_t fbl = fbReady ? 0 : _config.left;
   if (_checkDelay(_x == fbl ? _startscrolldelay : _scrolltime, _scrolldelay)) {
     _calcX();
     if (_active) _draw();
@@ -234,7 +255,7 @@ void ScrollWidget::loop() {
 }
 
 void ScrollWidget::_clear(){
-  if(_fb->ready()){
+  if(_fb && _fb->ready()){
     #ifdef PSFBUFFER
     _fb->fillRect(0, 0, _width, _textheight, _bgcolor);
     _fb->display();
@@ -247,12 +268,13 @@ void ScrollWidget::_clear(){
 void ScrollWidget::_draw() {
   if(!_active || _locked) return;
   _setTextParams();
+  const bool fbReady = (_fb && _fb->ready());
   if (_doscroll) {
-    uint16_t fbl = _fb->ready()?0:_config.left;
+    uint16_t fbl = fbReady ? 0 : _config.left;
     uint16_t _newx = fbl - _x;
     const char* _cursor = _text + _newx / _charWidth;
     uint16_t hiddenChars = _cursor - _text;
-    uint8_t addChars = _fb->ready()?2:1;
+    uint8_t addChars = fbReady ? 2 : 1;
     if (hiddenChars < strlen(_text)) {
     //TODO
     #pragma GCC diagnostic push
@@ -263,7 +285,7 @@ void ScrollWidget::_draw() {
       const char* _scursor = _sep + (_cursor - (_text + strlen(_text)));
       snprintf(_window, _width / _charWidth + addChars, "%s%s", _scursor, _text);
     }
-    if(_fb->ready()){
+    if(fbReady){
     #ifdef PSFBUFFER
       _fb->fillRect(0, 0, _width, _textheight, _bgcolor);
       _fb->setCursor(_x + hiddenChars * _charWidth, 0);
@@ -280,7 +302,7 @@ void ScrollWidget::_draw() {
       dsp.clearClipping();
     }
   } else {
-    if(_fb->ready()){
+    if(fbReady){
     #ifdef PSFBUFFER
       _fb->fillRect(0, 0, _width, _textheight, _bgcolor);
       _fb->setCursor(_realLeft(true), 0);
@@ -300,7 +322,8 @@ void ScrollWidget::_draw() {
 void ScrollWidget::_calcX() {
   if (!_doscroll || _config.textsize == 0) return;
   _x -= _scrolldelta;
-  uint16_t fbl = _fb->ready()?0:_config.left;
+  const bool fbReady = (_fb && _fb->ready());
+  uint16_t fbl = fbReady ? 0 : _config.left;
   if (-_x > _textwidth + _sepwidth - fbl) {
     _x = fbl;
     dsp.setScrollId(NULL);
@@ -320,13 +343,16 @@ bool ScrollWidget::_checkDelay(int m, uint32_t &tstamp) {
 
 void ScrollWidget::_reset(){
   dsp.setScrollId(NULL);
-  _x = _fb->ready()?0:_config.left;
+  const bool fbReady = (_fb && _fb->ready());
+  _x = fbReady ? 0 : _config.left;
   _scrolldelay = millis();
   _doscroll = _checkIsScrollNeeded();
   #ifdef PSFBUFFER
-  _fb->freeBuffer();
-  uint16_t _rl = (_config.align==WA_CENTER)?(dsp.width()-_width)/2:_config.left;
-  _fb->begin(&dsp, _rl, _config.top, _width, _textheight, _bgcolor);
+  if (_fb) {
+    _fb->freeBuffer();
+    uint16_t _rl = (_config.align==WA_CENTER)?(dsp.width()-_width)/2:_config.left;
+    _fb->begin(&dsp, _rl, _config.top, _width, _textheight, _bgcolor);
+  }
   #endif
 }
 
@@ -343,6 +369,26 @@ void SliderWidget::setValue(uint32_t val) {
   _value = val;
   if (_active && !_locked) _drawslider();
 
+}
+
+void SliderWidget::setColor(uint16_t fgcolor) {
+  // Если цвет не изменился, выходим без лишней перерисовки.
+  if (_fgcolor == fgcolor) return;
+
+  // Обновляем цвет заполненной части полосы.
+  _fgcolor = fgcolor;
+
+  // Если виджет активен и не заблокирован, сразу перерисовываем
+  // всю полосу, чтобы новый цвет применился даже при неизменной ширине.
+  if (_active && !_locked) _draw();
+}
+
+void SliderWidget::setMax(uint32_t maxval) {
+  // Защита от деления на ноль в map(_value, 0, _max, ...).
+  if (maxval == 0) maxval = 1;
+  if (_max == maxval) return;
+  _max = maxval;
+  if (_active && !_locked) _draw();
 }
 
 void SliderWidget::_drawslider() {
@@ -682,6 +728,9 @@ void ClockWidget::_printClock(bool force){
   auto& gfx = getRealDsp();
   gfx.setTextSize(Clock_GFXfontPtr==nullptr?TIME_SIZE:1);
   gfx.setFont(Clock_GFXfontPtr);
+#if DSP_MODEL==DSP_ILI9488 || DSP_MODEL==DSP_ILI9486
+  ili9488_updateCoverSlot(force);
+#endif
   bool clockInTitle=!config.isScreensaver && _config.top<_timeheight; //DSP_SSD1306x32
   if(force){
     _clearClock();
@@ -895,13 +944,15 @@ void BitrateWidget::_draw(){
   // ИСПРАВЛЕНИЕ:
   // 1) делаем размеры рамки (25x43),
   // 2) сдвигаем блок чуть выше для "воздуха" (на 396 вместо 401).
-  dsp.drawRect(4, 396, 25, 43, config.theme.div);
+  // 3) сдвиг влево на 2 px (4→2), вниз на 2 px (396→398) для рамки и текста L/R.
+   dsp.drawRect(2, 398, 25, 43, config.theme.div);
+  //dsp.drawRect(2, 400, 43, config.theme.div);
   dsp.setFont();
   dsp.setTextColor(config.theme.div, _bgcolor);
   dsp.setTextSize(2);
-  dsp.setCursor(12, 400);
+  dsp.setCursor(10, 402);
   dsp.printf("L");
-  dsp.setCursor(12, 417);
+  dsp.setCursor(10, 419);
   dsp.printf("R");
 
   dsp.setFont();

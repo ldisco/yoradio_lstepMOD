@@ -36,12 +36,24 @@ bool Telnet::begin(bool quiet) {
 }
 
 void Telnet::start() {
+  // Защита от повторного begin(): не трогаем сервер, если он уже поднят.
+  if (m_serverStarted) return;
   server.begin();
   server.setNoDelay(true);
+  // Фиксируем, что сервер успешно поднят и его API можно безопасно вызывать в loop().
+  m_serverStarted = true;
 }
 
 void Telnet::stop() {
+  // Если сервер не запускался, не выполняем никаких сетевых операций.
+  if (!m_serverStarted) return;
+  // Перед остановкой сервера корректно закрываем клиентские сессии.
+  for (int i = 0; i < MAX_TLN_CLIENTS; i++) {
+    if (clients[i]) clients[i].stop();
+  }
   server.stop();
+  // После stop() запрещаем любые hasClient()/accept() до следующего start().
+  m_serverStarted = false;
 }
 
 void Telnet::toggle() {
@@ -80,12 +92,21 @@ void Telnet::handleSerial(){
 
 void Telnet::loop() {
   if(network.status==SDREADY || network.status!=CONNECTED) {
+    // В SD/неподключённом режиме telnet-сервер не нужен.
+    // Если был поднят ранее (например, после режима WEB), выключаем его безопасно.
+    if (m_serverStarted) stop();
     handleSerial();
     return;
   }
   uint8_t i;
   if(config.store.telnet){
-    if (WiFi.status() == WL_CONNECTED) {
+    // Telnet разрешаем при STA или активном AP, чтобы не терять управление.
+    bool netReady = (WiFi.status() == WL_CONNECTED) || _isIPSet(WiFi.softAPIP());
+    if (netReady) {
+      // Ленивый старт: если режим сменился и сервер ещё не поднят — поднимаем здесь.
+      if (!m_serverStarted) start();
+      // Доп. страховка: если start() по какой-то причине не сработал, выходим без сетевых вызовов.
+      if (!m_serverStarted) { handleSerial(); return; }
       if (server.hasClient()) {
         for (i = 0; i < MAX_TLN_CLIENTS; i++) {
           if (!clients[i] || !clients[i].connected()) {
@@ -97,7 +118,9 @@ void Telnet::loop() {
             #else
             clients[i] = server.available();
             #endif
-            if (!clients[i]) Serial.println("available broken");
+            // Если accept/available вернул пустого клиента, не обращаемся к remoteIP()
+            // и не продолжаем обработку, чтобы не спровоцировать LoadProhibited.
+            if (!clients[i]) { Serial.println("available broken"); break; }
             on_connect(config.ipToStr(clients[i].remoteIP()), i);
             clients[i].setNoDelay(true);
             emptyClientStream(clients[i]);
@@ -125,8 +148,13 @@ void Telnet::loop() {
           clients[i].stop();
         }
       }
+      // Сеть недоступна — сервер тоже опускаем, чтобы не работать с невалидными сокетами.
+      if (m_serverStarted) stop();
       delay(1000);
     }
+  } else {
+    // Пользователь отключил telnet в настройках — гарантированно выключаем сервер.
+    if (m_serverStarted) stop();
   }
   handleSerial();
 }

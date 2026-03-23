@@ -6,6 +6,7 @@
 #include <Arduino.h>
 #include "../../core/player.h"
 #include "../../core/config.h" // Для lockLittleFS/unlockLittleFS, littleFsReady
+#include "../../core/options.h" // MIN_AUDIO_BUFFER_FOR_SSL_FACTS_PERCENT — порог буфера в % для запроса фактов
 #include "../../core/netserver.h" // [v0.4.4] Для доступа к AsyncWebSocket websocket
 #include "../../../myoptions.h" // [v0.3.23] Подключаем настройки прокси
 
@@ -15,6 +16,14 @@
 #include "providers/MusicBrainzProvider.h"
 #include "providers/LastFmProvider.h"
 #include "providers/iTunesProvider.h"
+
+#ifndef TRACKFACTS_AUTO_GEMINI_ENABLE
+  #define TRACKFACTS_AUTO_GEMINI_ENABLE true
+#endif
+
+#ifndef TRACKFACTS_AUTO_DEEPSEEK_ENABLE
+  #define TRACKFACTS_AUTO_DEEPSEEK_ENABLE true
+#endif
 
 // Внешние ссылки на метаданные из конфигурации плеера
 extern String metaTitle;
@@ -37,7 +46,11 @@ TrackFacts::TrackFacts()
     factsPerTrack(3), factRequestCounter(0),
     trackChangeMs(0), autoRequestDone(false),
     manualRequestPending(false), manualRequestAtMs(0),
+    manualRequestDeadlineMs(0), manualStableSinceMs(0),
+    _pendingFetchIsManual(false),
+    _factsSslEpoch(0),
     _failoverActive(false), _failoverNotified(false),
+    _suppressFailoverToastUntilMs(0),
     lastStatusMs(0) {
   _factsMutex = xSemaphoreCreateMutex(); // [v0.3.23] Инициализация мьютекса
 
@@ -72,13 +85,17 @@ void TrackFacts::on_track_change() {
   autoRequestDone = false;
   manualRequestPending = false;
   manualRequestAtMs = 0;
+  manualRequestDeadlineMs = 0;
+  manualStableSinceMs = 0;
   currentFacts.clear();
   // [Gemini3Pro] Резервируем память под 5 элементов во избежание множественных реаллокаций в DRAM
   if (currentFacts.capacity() < 5) {
       currentFacts.reserve(5); 
   }
   currentFactIndex = 0;
-  isRequestInProgress = false;
+  _factsSslEpoch++;
+  // НЕ isRequestInProgress = false — параллельный TLS с CoverDL (см. on_station_change).
+  resumeDeferredCoverDownload();
   factRequestCounter = 0;
   // [v0.4.1] Немедленно очищаем глобальную переменную, чтобы старый факт не показывался в WebUI
   ::currentFact = "";
@@ -108,8 +125,11 @@ void TrackFacts::on_station_change() {
   autoRequestDone = false;
   manualRequestPending = false;
   manualRequestAtMs = 0;
+  manualRequestDeadlineMs = 0;
+  manualStableSinceMs = 0;
   factRequestCounter = 0;
   isRequestInProgress = false;
+  resumeDeferredCoverDownload();
   _failoverActive = false;
   _failoverNotified = false;
   lastStatusMs = 0;
@@ -156,6 +176,29 @@ void TrackFacts::on_ticker() {
   uint32_t now = millis();
   if (now - lastTickerCheck < 1000) return; // Проверка раз в секунду
   lastTickerCheck = now;
+
+  // Дедлайн ручного запроса — ДО раннего return по обложке: иначе пока CoverDL блокирует тикер,
+  // отмена не проверялась, а после обложки срабатывала уже во время FactsTask (ложный тост).
+  if (manualRequestPending && manualRequestDeadlineMs > 0 && now > manualRequestDeadlineMs &&
+      !isRequestInProgress) {
+    String rejectReason;
+    if (!canRunManualLowBufferRetry(now, &rejectReason)) {
+      if (rejectReason.length() == 0) {
+        rejectReason =
+            "Запрос факта отклонён: поток нестабилен или буфер слишком мал. Попробуйте позже.";
+      }
+      sendStatus(rejectReason.c_str(), true);
+      manualRequestPending = false;
+      manualRequestDeadlineMs = 0;
+    } else {
+      // Условия уже ОК, но тикер долго не доходил до fetch (обложка) — продлеваем окно.
+      manualRequestDeadlineMs = now + 30000u;
+    }
+  }
+
+  // Обновляем окно стабильности потока для сценария ручного low-buffer retry.
+  // Это позволяет разрешать ручной запрос даже при буфере 5%, если поток стабилен 10 секунд.
+  updateManualStabilityWindow(now);
 
   // Если в данный момент скачивается обложка — ждем. 
   // Это предотвращает конфликт за оперативную память (SSL) и LittleFS.
@@ -210,7 +253,9 @@ void TrackFacts::on_ticker() {
       xSemaphoreGive(_factsMutex);
     }
     factLoaded = false;
-    isRequestInProgress = false;
+    _factsSslEpoch++;
+    // НЕ isRequestInProgress = false — см. on_station_change (параллельный TLS с CoverDL).
+    resumeDeferredCoverDownload();
     factLoadTime = now;
     factRequestCounter = 0;
     _failoverNotified = false;
@@ -254,15 +299,40 @@ void TrackFacts::on_ticker() {
     bool canManual = (manualRequestPending && now >= manualRequestAtMs);
 
     if ((canAuto || canManual) && lastParsedTitle.indexOf("[") < 0) {
-      // [FIX v0.8.78] На FLAC-потоках DeepSeek/Gemini иногда вызывают заметные фризы
+      // Синхронизируем effective source ДО FLAC-гейта:
+      // иначе on_ticker может принять решение по старому _effectiveSource,
+      // а в fetchFact() после checkFailover стартует уже другой провайдер (например DeepSeek).
+      checkFailover();
+      // [FIX v0.8.81] На FLAC-потоках DeepSeek/Gemini иногда вызывают заметные фризы
       // и даже сетевые assert (lwIP/pbuf_free) из-за тяжёлых TLS/JSON операций параллельно
       // с декодированием. Для стабильности: на FLAC блокируем АВТОМАТИЧЕСКИЕ AI-запросы,
       // но сохраняем возможность РУЧНОГО запроса по желанию пользователя.
       // Важно: файловый кэш при этом продолжает работать — если факт уже в кэше, он покажется.
       const bool isFlacStream =
-        (config.getMode() == PM_WEB) && (config.getBitrateFormat() == BF_FLAC);
+        (config.getMode() == PM_WEB) &&
+        (config.getBitrateFormat() == BF_FLAC || g_audioFormatFlacActive);
+      // ВАЖНО:
+      // - Используем _effectiveSource, а не currentSource.
+      // - Сценарий: пользователь выбрал Gemini/DeepSeek без ключа → checkFailover()
+      //   подставляет _effectiveSource = ITUNES. В этом случае считаем источник НЕ AI
+      //   и НЕ блокируем авто‑запросы iTunes (иначе iTunes "умирал" и работал только вручную).
       const bool isHeavyAiSource =
-        (currentSource == FactSource::GEMINI || currentSource == FactSource::DEEPSEEK);
+        (_effectiveSource == FactSource::GEMINI || _effectiveSource == FactSource::DEEPSEEK);
+      const bool autoGeminiBlocked =
+        (canAuto && _effectiveSource == FactSource::GEMINI && !TRACKFACTS_AUTO_GEMINI_ENABLE);
+      const bool autoDeepSeekBlocked =
+        (canAuto && _effectiveSource == FactSource::DEEPSEEK && !TRACKFACTS_AUTO_DEEPSEEK_ENABLE);
+      if (autoGeminiBlocked || autoDeepSeekBlocked) {
+        autoRequestDone = true;  // Не повторяем автопопытки до следующей смены трека.
+        // [REQ] Если авто-facts для провайдера принудительно отключены в myoptions.h,
+        // не спамим пользователя сообщениями (и в Serial, и в WebUI).
+        // Для предотвращения “штормов” обновляем lastStatusMs, но toast не отправляем.
+        if (now - lastStatusMs > 5000) {
+          lastStatusMs = now;
+        }
+        canAuto = false;
+        if (!canManual) return;
+      }
       if (isFlacStream && isHeavyAiSource && canAuto) {
         autoRequestDone = true;  // не пытаться автозапросом снова и снова
         if (now - lastStatusMs > 5000) {
@@ -274,12 +344,68 @@ void TrackFacts::on_ticker() {
         if (!canManual) return;
       }
 
+      // [FIX] Не запускаем SSL-запрос, пока аудио-буфер ниже порога (в % от размера буфера).
+      // Факты разрешены при заполнении >= MIN_AUDIO_BUFFER_FOR_SSL_FACTS_PERCENT (8%).
+      if (player.isRunning()) {
+        uint32_t total = player.getInBufferSize();
+        uint32_t minFilled = total ? (total * (uint32_t)MIN_AUDIO_BUFFER_FOR_SSL_FACTS_PERCENT / 100u) : 0u;
+        if (player.inBufferFilled() < minFilled) {
+          // Для АВТО-режима сохраняем старое строгое поведение: низкий буфер = отложить.
+          // Для РУЧНОГО запроса разрешаем special retry: 5% буфера + стабильный поток 10 сек.
+          bool allowManualLowBuffer = false;
+          if (canManual) {
+            String rejectReason;
+            allowManualLowBuffer = canRunManualLowBufferRetry(now, &rejectReason);
+            if (!allowManualLowBuffer && now - lastStatusMs > 3000) {
+              // Если ручной запрос пока нельзя выполнить, сообщаем пользователю причину.
+              // Сообщение отправляем не чаще, чем раз в 3 секунды, чтобы не спамить toast.
+              sendStatus(rejectReason.c_str(), true);
+              lastStatusMs = now;
+            }
+          }
+          if (!allowManualLowBuffer) {
+            // Serial отдельно от lastStatusMs: раз в 30 с — постоянное «тонкое» аудио иначе засоряло монитор каждые 5 с.
+            static uint32_t lastLowBufferSerialMs = 0;
+            if (now - lastLowBufferSerialMs >= 30000u) {
+              Serial.println("[TrackFacts] Запрос отложен: низкий буфер потока (приоритет — стабильность звука)");
+              lastLowBufferSerialMs = now;
+            }
+            if (now - lastStatusMs > 5000) {
+              lastStatusMs = now;
+            }
+            return;
+          }
+        }
+      }
+
       // [FIX] Перед сетевым запросом проверяем безопасность SSL именно для фактов.
       if (isSafeForSSLForFacts()) {
         factRequestCounter++;
+        // #region agent log
+        Serial.printf("[AGENT][H1] facts approved manual=%d counter=%d source=%d free=%u max=%u\n",
+                      canManual ? 1 : 0,
+                      factRequestCounter,
+                      (int)_effectiveSource,
+                      (unsigned)ESP.getFreeHeap(),
+                      (unsigned)ESP.getMaxAllocHeap());
+        // #endregion
+        _pendingFetchIsManual = canManual;
         fetchFact(lastArtist, lastParsedTitle);
         factLoadTime = now;
       } else {
+        static uint32_t lastAgentSslBlockLogMs = 0;
+        if (now - lastAgentSslBlockLogMs >= 3000u) {
+          // #region agent log
+          Serial.printf("[AGENT][H1] facts blocked manual=%d cover=%d modeSwitch=%d wifi=%d free=%u max=%u\n",
+                        canManual ? 1 : 0,
+                        g_coverTaskRunning ? 1 : 0,
+                        g_modeSwitching ? 1 : 0,
+                        (int)WiFi.status(),
+                        (unsigned)ESP.getFreeHeap(),
+                        (unsigned)ESP.getMaxAllocHeap());
+          // #endregion
+          lastAgentSslBlockLogMs = now;
+        }
         // [v0.4.3] Детальные логи в монитор порта для анализа задержек
         if (now - lastStatusMs > 3000) {
           if (g_modeSwitching) {
@@ -305,6 +431,7 @@ void TrackFacts::on_ticker() {
       }
       if (canManual) {
         manualRequestPending = false;
+        manualRequestDeadlineMs = 0;
       }
     }
   }
@@ -353,8 +480,8 @@ void TrackFacts::checkFailover() {
     _effectiveSource = FactSource::ITUNES;
     _failoverActive = true;
     
-    // Уведомляем пользователя один раз за песню
-    if (!_failoverNotified) {
+    // Уведомляем пользователя один раз за песню (не сразу после смены провайдера — даём время ввести ключ)
+    if (!_failoverNotified && millis() >= _suppressFailoverToastUntilMs) {
       char buf[128];
       snprintf(buf, sizeof(buf), "%s: нет API ключа. Переключено на iTunes.", provider->name());
       sendStatus(buf, true); // true = ошибка (красный тост)
@@ -372,8 +499,9 @@ void TrackFacts::sendStatus(const char* msg, bool isError) {
   if (msg == nullptr) return;
   
   // Формируем JSON пакет: {"toast": "текст", "isErr": 0/1}
+  // [FIX] Ограничиваем длину msg (%.200s), чтобы не переполнить buf и не раздуть WebSocket-кадр.
   char buf[256];
-  snprintf(buf, sizeof(buf), "{\"toast\": \"%s\", \"isErr\": %d}", msg, isError ? 1 : 0);
+  snprintf(buf, sizeof(buf), "{\"toast\": \"%.200s\", \"isErr\": %d}", msg, isError ? 1 : 0);
   
   // [v0.4.4] Отправляем всем подключенным веб-клиентам
   // Используем extern AsyncWebSocket websocket из netserver.h
@@ -404,23 +532,39 @@ bool isIterativeSource(FactSource source) {
 // Запуск задачи получения факта (в отдельном потоке на Core 1)
 // ============================================================================
 void TrackFacts::fetchFact(const String& artist, const String& title) {
-  if (isRequestInProgress) return;
+  if (isRequestInProgress) {
+    Serial.println("[TrackFacts] Skip: previous request still in progress (wait for POST/SSL to finish)");
+    return;
+  }
+  // Сразу блокируем повторный вход из on_ticker (иначе два одобрения до xTaskCreate → два FactsTask).
+  isRequestInProgress = true;
 
   // --- Проверка failover перед запросом ---
   checkFailover();
 
-  // Если failover только что уведомил пользователя и это первый запрос,
-  // даём пользователю увидеть сообщение, не запускаем fetch сразу
-  // (на следующем тике уведомление уже показано, _failoverNotified = true)
-  // Этот блок не нужен — уведомление уже установлено в checkFailover(),
-  // а запрос всё равно будет на MusicBrainz. Пусть идёт.
-
-  isRequestInProgress = true;
+  // Политика WEB+FLAC: только АВТО-запрос блокируем AI (DeepSeek/Gemini) на FLAC.
+  // Ручной запрос пользователя — пропускаем как есть (DeepSeek работает при достаточном heap).
+  if (!_pendingFetchIsManual) {
+    const bool flacHeuristic =
+        (config.getMode() == PM_WEB) &&
+        (config.getBitrateFormat() == BF_FLAC || g_audioFormatFlacActive);
+    if (flacHeuristic &&
+        (_effectiveSource == FactSource::GEMINI || _effectiveSource == FactSource::DEEPSEEK)) {
+      // #region agent log
+      Serial.printf("[AGENT][H6] FLAC policy: forcing iTunes for AUTO (was src=%d flacHint=%d bf=%d)\n",
+                    (int)_effectiveSource,
+                    g_audioFormatFlacActive ? 1 : 0,
+                    (int)config.getBitrateFormat());
+      // #endregion
+      _effectiveSource = FactSource::ITUNES;
+    }
+  }
 
   TaskParams* params = new TaskParams;
   params->artist = artist;
   params->title = title;
   params->instance = this;
+  params->sslEpoch = _factsSslEpoch;
 
   // Сетевой запрос фактов выполняем на Core 1.
   // Попытка переноса на Core 0 в v0.8.77 привела к редким assert в lwIP (pbuf_free),
@@ -429,11 +573,11 @@ void TrackFacts::fetchFact(const String& artist, const String& title) {
   xTaskCreatePinnedToCore(
     fetchTask,
     "FactsTask",
-    16384, // Вернули безопасный размер стека 16KB
+    16384,
     params,
-    1,
+    1, // Приоритет 1 (как CoverDL) — иначе TLS handshake CPU-starved → сервер EOF
     NULL,
-    1 // Core 1: стабильный вариант без lwIP assert
+    1
   );
 }
 
@@ -445,13 +589,24 @@ void TrackFacts::fetchTask(void* parameter) {
   TaskParams* p = (TaskParams*)parameter;
   if (p && p->instance) {
     TrackFacts* instance = p->instance;
+    const uint32_t taskStartMs = millis();
 
     // [FIX] Если факты отключены — выходим без логов и без сетевых запросов.
     if (!instance->_enabled) {
         instance->isRequestInProgress = false;
+        resumeDeferredCoverDownload();
         delete p;
         vTaskDelete(NULL);
         return;
+    }
+
+    if (p->sslEpoch != instance->_factsSslEpoch) {
+      Serial.println("[TrackFacts] Task aborted: stale sslEpoch (station/track changed before SSL)");
+      instance->isRequestInProgress = false;
+      resumeDeferredCoverDownload();
+      delete p;
+      vTaskDelete(NULL);
+      return;
     }
 
     // --- ЖЕСТКАЯ ПРОВЕРКА: если трек сменился, немедленно прерываемся ---
@@ -464,6 +619,7 @@ void TrackFacts::fetchTask(void* parameter) {
         Serial.printf("[TrackFacts] Task aborted: track changed. Req: '%s', Curr: '%s'\n",
                       paramTitle.c_str(), currentTitle.c_str());
         instance->isRequestInProgress = false;
+        resumeDeferredCoverDownload();
         delete p;
         vTaskDelete(NULL);
         return;
@@ -473,7 +629,15 @@ void TrackFacts::fetchTask(void* parameter) {
     //        Это критично: SSL handshake может блокировать на 5+ секунд
     if (!isSafeForSSLForFacts()) {
       Serial.println("[TrackFacts] Task aborted: SSL not safe (heap/wifi/cooldown)");
+      // #region agent log
+      Serial.printf("[AGENT][H1] fetch pre-ssl abort free=%u max=%u wifi=%d mode=%d\n",
+                    (unsigned)ESP.getFreeHeap(),
+                    (unsigned)ESP.getMaxAllocHeap(),
+                    (int)WiFi.status(),
+                    (int)config.getMode());
+      // #endregion
       instance->isRequestInProgress = false;
+      resumeDeferredCoverDownload();
       delete p;
       vTaskDelete(NULL);
       return;
@@ -486,21 +650,73 @@ void TrackFacts::fetchTask(void* parameter) {
     FactSource sourceToUse = instance->_effectiveSource;
     FactProvider* provider = instance->getProvider(sourceToUse);
 
+    // После сбойного HTTPS дать lwIP «остыть» перед снятием busy и CoverDL — иначе редкий assert
+    // pbuf_free(... p->ref > 0) в Audio::processWebStream при параллельном чтении потока.
+    bool needLwIpCoolDown = false;
+
     if (provider) {
+      // #region agent log
+      Serial.printf("[AGENT][H5] provider begin src=%d name=%s free=%u max=%u\n",
+                    (int)sourceToUse,
+                    provider->name(),
+                    (unsigned)ESP.getFreeHeap(),
+                    (unsigned)ESP.getMaxAllocHeap());
+      // #endregion
       Serial.printf("[TrackFacts] Fetching from %s...\n", provider->name());
       FactResult result = provider->fetchFact(p->artist, p->title);
+      bool usedItunesFallback = false;
 
-      if (result.success && result.fact.length() > 0) {
+      // Если DeepSeek/Gemini не достучались до сети или отрезали по heap (pre-POST),
+      // один раз пробуем iTunes — другой хост, как в шпаргалке (лёгкий failover, без циклов).
+      if (!result.success &&
+          (sourceToUse == FactSource::DEEPSEEK || sourceToUse == FactSource::GEMINI) &&
+          (result.errorMsg.indexOf("Connection failed") >= 0 ||
+           result.errorMsg.indexOf("SSL not safe") >= 0 ||
+           result.errorMsg.indexOf("HTTP error") >= 0)) {
+        FactProvider* fb = instance->getProvider(FactSource::ITUNES);
+        if (fb) {
+          Serial.println("[TrackFacts] AI unreachable, one-shot iTunes fallback");
+          // #region agent log
+          Serial.printf("[AGENT][H3] fallback start src=%d err=%s free=%u max=%u\n",
+                        (int)sourceToUse,
+                        result.errorMsg.c_str(),
+                        (unsigned)ESP.getFreeHeap(),
+                        (unsigned)ESP.getMaxAllocHeap());
+          // #endregion
+          // После отказа AI по heap/ssl подождать восстановления кучи и lwIP.
+          {
+            uint32_t t0 = millis();
+            while (!isSafeForSSLForFacts() && (millis() - t0) < 6000) {
+              vTaskDelay(pdMS_TO_TICKS(80));
+            }
+          }
+          vTaskDelay(pdMS_TO_TICKS(1200));
+          if (p->sslEpoch != instance->_factsSslEpoch) {
+            result.success = false;
+            result.errorMsg = "stale epoch";
+          } else {
+            result = fb->fetchFact(p->artist, p->title);
+            if (result.success && result.fact.length() > 0) {
+              usedItunesFallback = true;
+            }
+          }
+        }
+      }
+
+      const bool epochStale = (p->sslEpoch != instance->_factsSslEpoch);
+
+      if (!epochStale && result.success && result.fact.length() > 0) {
         // [FIX] Если плагин выключили пока запрос летел — не обновляем UI
         if (!instance->_enabled) {
           Serial.println("[TrackFacts] Disabled during request — discarding result");
           instance->isRequestInProgress = false;
+          resumeDeferredCoverDownload();
           delete p;
           vTaskDelete(NULL);
           return;
         }
-        // Кэшируем "дорогие" AI-факты (Gemini, DeepSeek)
-        if (instance->shouldCacheFact(sourceToUse)) {
+        // Кэшируем AI-факты; текст после iTunes-failover не кладём в AI-кэш (это метаданные iTunes).
+        if (instance->shouldCacheFact(sourceToUse) && !usedItunesFallback) {
           String trackKey = instance->generateTrackKey(p->artist, p->title);
           instance->saveFactToCache(trackKey, result.fact);
         }
@@ -510,11 +726,13 @@ void TrackFacts::fetchTask(void* parameter) {
         // [v0.4.1] Один запуск FREE-провайдеров (iTunes, MusicBrainz, LastFM)
         // возвращает всю информацию за раз. AI-провайдеры (итеративные) требуют 
         // несколько запросов для сбора нужного количества фактов.
-        if (!isIterativeSource(sourceToUse)) {
-          instance->factLoaded = true;  // Обычный провайдер — один запрос и хватит
+        if (!isIterativeSource(sourceToUse) || usedItunesFallback) {
+          instance->factLoaded = true;
         } else if (instance->currentFacts.size() >= (size_t)instance->factsPerTrack) {
           instance->factLoaded = true;  // AI — достаточно фактов собрано
         }
+      } else if (epochStale) {
+        Serial.println("[TrackFacts] Discarding fact result: station/track changed during fetch (SSL epoch)");
       } else {
         Serial.printf("[TrackFacts] %s failed: %s\n", provider->name(), result.errorMsg.c_str());
         // [v0.4.1] Если обычный (не AI) провайдер ответил ошибкой (например, 404),
@@ -523,13 +741,30 @@ void TrackFacts::fetchTask(void* parameter) {
           instance->factLoaded = true;
         }
       }
+      if (!result.success) {
+        needLwIpCoolDown = true;
+      }
+      // #region agent log
+      Serial.printf("[AGENT][H5] provider end ok=%d fallback=%d cooldown=%d err=%s elapsed=%lu free=%u max=%u\n",
+                    result.success ? 1 : 0,
+                    usedItunesFallback ? 1 : 0,
+                    needLwIpCoolDown ? 1 : 0,
+                    result.errorMsg.c_str(),
+                    (unsigned long)(millis() - taskStartMs),
+                    (unsigned)ESP.getFreeHeap(),
+                    (unsigned)ESP.getMaxAllocHeap());
+      // #endregion
     } else {
       Serial.printf("[TrackFacts] Unknown/null provider for source %d\n", (int)sourceToUse);
     }
 
     // Сбрасываем флаг после завершения всей работы
     instance->isRequestInProgress = false;
+    if (needLwIpCoolDown) {
+      vTaskDelay(pdMS_TO_TICKS(2000));
+    }
   }
+  resumeDeferredCoverDownload();
   if (p) delete p;
   vTaskDelete(NULL);
 }
@@ -794,8 +1029,8 @@ void TrackFacts::registerFactsCacheFile(const String& path) {
     filtered.push_back(e);
   }
 
-  // LRU ротация: удаляем самые старые файлы, пока объём > FACTS_CACHE_MAX_BYTES (1 МБ)
-  while (total > FACTS_CACHE_MAX_BYTES && !filtered.empty()) {
+  // LRU ротация: удаляем самые старые файлы, пока объём > FACTS_CACHE_MAX_BYTES_LIMIT
+  while (total > FACTS_CACHE_MAX_BYTES_LIMIT && !filtered.empty()) {
     FactsCacheEntry oldest = filtered.front();
     filtered.erase(filtered.begin());
     if (LittleFS.exists(oldest.path)) {
@@ -892,10 +1127,17 @@ void TrackFacts::setProvider(uint8_t provider) {
     factRequestCounter = 0;
     factLoaded = false;
     isRequestInProgress = false;
+    resumeDeferredCoverDownload();
     _failoverActive = false;
     _failoverNotified = false;
     autoRequestDone = false; // Разрешаем повторный авто-запрос для текущей песни
     lastStatusMs = 0;
+
+    FactProvider* newProv = getProvider(currentSource);
+    const bool needsKeyButEmpty =
+      newProv && newProv->needsApiKey() && geminiApiKey.length() == 0;
+    // Пока пользователь вводит ключ в настройках — не спамим тостом failover и не форсим немедленный SSL.
+    _suppressFailoverToastUntilMs = needsKeyButEmpty ? (millis() + 90000u) : 0u;
 
     // Очищаем кэш фактов и глобальную строку под мьютексом — WebUI должен немедленно
     // перестать отображать результат старого провайдера. Новый провайдер заполнит
@@ -908,7 +1150,8 @@ void TrackFacts::setProvider(uint8_t provider) {
 
     // Даем возможность новому провайдеру сработать быстрее (сбрасываем таймер ожидания),
     // чтобы автозапрос не ждал ещё 7 секунд после переключения провайдера.
-    factLoadTime = millis() - 40000;
+    // Если выбран AI без ключа — не форсим немедленный fetch+iTunes failover (пользователь ещё в настройках).
+    factLoadTime = needsKeyButEmpty ? millis() : (millis() - 40000);
     
     // Уведомляем пользователя
     sendStatus("Провайдер изменен. Поиск фактов...");
@@ -922,6 +1165,7 @@ void TrackFacts::setGeminiApiKey(const String& key) {
   if (key.length() > 0) {
     _failoverActive = false;
     _failoverNotified = false;
+    _suppressFailoverToastUntilMs = 0;
   }
 }
 
@@ -942,6 +1186,7 @@ void TrackFacts::setEnabled(bool enabled) {
     // [FIX] При выключении чистим состояние и убираем факт из WebUI.
     // Это предотвращает остаточные логи/данные после отключения в веб-настройках.
     isRequestInProgress = false;
+    resumeDeferredCoverDownload();
     factLoaded = false;
     factRequestCounter = 0;
     currentFacts.clear();
@@ -950,9 +1195,200 @@ void TrackFacts::setEnabled(bool enabled) {
 }
 
 // Ручной запрос факта из WebUI (по клику на логотип/обложку)
-void TrackFacts::requestManualFact() {
-  if (!_enabled) return;
-  if (!currentFacts.empty()) return; // Уже есть факты в кэше
+// Возвращает true, если был запланирован НОВЫЙ сетевой запрос.
+// Возвращает false, если факты уже есть (RAM/файловый кэш) или запрос уже в процессе.
+bool TrackFacts::requestManualFact(String* rejectReason) {
+  // Подробная проверка №1: если модуль выключен, ничего не делаем.
+  if (!_enabled) {
+    if (rejectReason) *rejectReason = "TrackFacts выключен в настройках.";
+    return false;
+  }
+
+  // Ручной запрос поддерживается в WEB и SD-режиме.
+  // В SD-режиме факты тоже можно запрашивать, если есть интернет (WiFi проверяется ниже).
+  uint8_t mode = config.getMode();
+  if (mode != PM_WEB && mode != PM_SDCARD) {
+    if (rejectReason) *rejectReason = "Ручной запрос факта доступен только в WEB/SD-режимах.";
+    return false;
+  }
+
+  // Подробная проверка №2: если факты уже есть в оперативном состоянии текущего трека,
+  // не ставим повторный сетевой запрос и не триггерим лишний "ожидание..." статус.
+  bool hasFactsInRam = false;
+  if (xSemaphoreTake(_factsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    hasFactsInRam = !currentFacts.empty() || (::currentFact.length() > 0);
+    xSemaphoreGive(_factsMutex);
+  } else {
+    // Если мьютекс временно недоступен, используем мягкий fallback по глобальной строке.
+    hasFactsInRam = (::currentFact.length() > 0);
+  }
+  if (hasFactsInRam) {
+    if (rejectReason) *rejectReason = "Факт уже доступен: используем данные из памяти/кэша.";
+    return false;
+  }
+
+  // Подробная проверка №3: перед постановкой ручного запроса пытаемся поднять факты из файлового кэша.
+  // Это устраняет кейс "факт есть/был, но UI не успел синхронизироваться" без запуска API-запроса.
+  String artist = lastArtist;
+  String title = lastParsedTitle;
+  artist.trim();
+  title.trim();
+  if (title.length() > 0) {
+    String trackKey = generateTrackKey(artist, title);
+    std::vector<String> cachedFacts;
+    if (getFactsFromCache(trackKey, cachedFacts)) {
+      if (xSemaphoreTake(_factsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        currentFacts = cachedFacts;
+        String allFacts = "";
+        for (size_t i = 0; i < currentFacts.size(); i++) {
+          if (i > 0) allFacts += "###";
+          allFacts += currentFacts[i];
+        }
+        ::currentFact = allFacts;
+        // Помечаем автозапрос как выполненный, т.к. данные уже показаны из кэша.
+        autoRequestDone = true;
+        xSemaphoreGive(_factsMutex);
+      } else {
+        // Даже если мьютекс занят, запишем в глобальную строку "снаружи",
+        // чтобы /api/current-fact не возвращал пустой ответ.
+        String allFacts = "";
+        for (size_t i = 0; i < cachedFacts.size(); i++) {
+          if (i > 0) allFacts += "###";
+          allFacts += cachedFacts[i];
+        }
+        ::currentFact = allFacts;
+      }
+      if (rejectReason) *rejectReason = "Факт получен из файлового кэша, сетевой запрос не требуется.";
+      return false;
+    }
+  }
+
+  // Подробная проверка №4: если ручной запрос уже ожидает исполнения
+  // или сетевой запрос уже выполняется, не дублируем очередь.
+  if (manualRequestPending || isRequestInProgress) {
+    if (rejectReason) *rejectReason = "Запрос факта уже выполняется. Подождите завершения.";
+    return false;
+  }
+
+  // Перед постановкой ручного запроса проверяем, что поток достаточно стабилен
+  // для low-buffer retry сценария (5% + 10 сек без разрывов).
+  // Это предотвращает долгий pending в ситуациях, когда звук уже рвётся.
+  uint32_t now = millis();
+  String localRejectReason;
+  if (!canRunManualLowBufferRetry(now, &localRejectReason)) {
+    if (rejectReason) *rejectReason = localRejectReason;
+    return false;
+  }
+
+  // Здесь реально планируем новый сетевой запрос.
   manualRequestPending = true;
-  manualRequestAtMs = millis() + FACT_MANUAL_DELAY;
+  manualRequestAtMs = now + FACT_MANUAL_DELAY;
+  // Ограничиваем время ожидания условий запуска:
+  // FACT_MANUAL_DELAY + окно стабильности + EXTRA (пока ждём конец CoverDL без обработки fetch).
+  manualRequestDeadlineMs =
+      manualRequestAtMs + MANUAL_FACTS_STABLE_WINDOW_MS + MANUAL_FACTS_EXTRA_WAIT_MS;
+  if (rejectReason) *rejectReason = "";
+  return true;
+}
+
+void TrackFacts::updateManualStabilityWindow(uint32_t now) {
+  // Условие 1: low-buffer retry актуален только для WEB и только когда реально играет поток.
+  if (config.getMode() != PM_WEB || player.status() != PLAYING || !player.isRunning()) {
+    manualStableSinceMs = 0;
+    return;
+  }
+
+  // Условие 2: буфер должен быть не ниже минимального ручного порога (по умолчанию 5%).
+  uint32_t total = player.getInBufferSize();
+  if (total == 0) {
+    manualStableSinceMs = 0;
+    return;
+  }
+  uint32_t filled = player.inBufferFilled();
+  uint32_t minRetryFilled = (total * (uint32_t)MANUAL_FACTS_MIN_BUFFER_PERCENT) / 100u;
+  if (filled < minRetryFilled) {
+    manualStableSinceMs = 0;
+    return;
+  }
+
+  // Условие 3: должны регулярно приходить новые данные потока.
+  // Если активность не обновлялась >1500 мс, считаем поток нестабильным.
+  extern volatile uint32_t g_lastWebStreamActivityMs;
+  uint32_t silenceMs = now - g_lastWebStreamActivityMs;
+  if (silenceMs > 1500) {
+    manualStableSinceMs = 0;
+    return;
+  }
+
+  // Все условия выполнены — запускаем/продолжаем окно стабильности.
+  if (manualStableSinceMs == 0) {
+    manualStableSinceMs = now;
+  }
+}
+
+bool TrackFacts::canRunManualLowBufferRetry(uint32_t now, String* rejectReason) const {
+  // Проверка базового состояния сети/плеера.
+  if (WiFi.status() != WL_CONNECTED) {
+    if (rejectReason) *rejectReason = "Запрос факта отклонён: WiFi не подключен.";
+    return false;
+  }
+  if (player.status() != PLAYING || !player.isRunning()) {
+    if (rejectReason) *rejectReason = "Запрос факта отклонён: воспроизведение не активно.";
+    return false;
+  }
+
+  // Поддерживаем ручной запрос в WEB и SD.
+  // Для других режимов запрос невалиден.
+  uint8_t mode = config.getMode();
+  if (mode != PM_WEB && mode != PM_SDCARD) {
+    if (rejectReason) *rejectReason = "Запрос факта отклонён: режим не поддерживается.";
+    return false;
+  }
+  // Для SD-проигрывания не применяем WEB-ограничения по буферу/стабильности потока:
+  // в локальном воспроизведении они не отражают реальный риск "подвисания" сети.
+  if (mode == PM_SDCARD) {
+    if (rejectReason) *rejectReason = "";
+    return true;
+  }
+
+  // Проверяем минимальный ручной порог буфера (5% по умолчанию).
+  uint32_t total = player.getInBufferSize();
+  uint32_t filled = player.inBufferFilled();
+  if (total == 0) {
+    if (rejectReason) *rejectReason = "Запрос факта отклонён: буфер потока не готов.";
+    return false;
+  }
+  uint32_t retryMinFilled = (total * (uint32_t)MANUAL_FACTS_MIN_BUFFER_PERCENT) / 100u;
+  if (filled < retryMinFilled) {
+    if (rejectReason) {
+      char msg[160];
+      snprintf(msg, sizeof(msg),
+               "Запрос факта отклонён: буфер %u%% < %u%%.",
+               (unsigned)((filled * 100u) / total),
+               (unsigned)MANUAL_FACTS_MIN_BUFFER_PERCENT);
+      *rejectReason = String(msg);
+    }
+    return false;
+  }
+
+  // Требуем непрерывно стабильный поток в течение 10 секунд.
+  if (manualStableSinceMs == 0) {
+    if (rejectReason) *rejectReason = "Запрос факта отклонён: ждём стабилизацию потока (10 сек).";
+    return false;
+  }
+  uint32_t stableMs = now - manualStableSinceMs;
+  if (stableMs < MANUAL_FACTS_STABLE_WINDOW_MS) {
+    if (rejectReason) {
+      uint32_t leftSec = (MANUAL_FACTS_STABLE_WINDOW_MS - stableMs + 999u) / 1000u;
+      char msg[180];
+      snprintf(msg, sizeof(msg),
+               "Запрос факта отклонён: поток ещё не стабилен (%u сек до допуска).",
+               (unsigned)leftSec);
+      *rejectReason = String(msg);
+    }
+    return false;
+  }
+
+  if (rejectReason) *rejectReason = "";
+  return true;
 }

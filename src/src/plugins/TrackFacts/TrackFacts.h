@@ -47,7 +47,7 @@ public:
   void setLanguage(FactLanguage lang);
   void setFactCount(uint8_t count);    // Настройка количества фактов на один трек (1-5)
   void setEnabled(bool enabled);
-  void requestManualFact();            // Ручной запрос факта из WebUI
+  bool requestManualFact(String* rejectReason = nullptr); // Ручной запрос факта из WebUI (true = запрос поставлен в очередь)
   bool isRequestPending() const { return manualRequestPending || isRequestInProgress; }
   
   // [v0.4.2] Система уведомлений (Toast)
@@ -78,6 +78,8 @@ private:
       String artist;
       String title;
       TrackFacts* instance;
+      /** Снимок _factsSslEpoch на момент fetchFact; при смене станции/трека эпоха растёт — результат отбрасываем. */
+      uint32_t sslEpoch;
   };
   static void fetchTask(void* parameter);
 
@@ -91,12 +93,19 @@ private:
   bool autoRequestDone;          // Был ли выполнен авто-запрос для трека
   bool manualRequestPending;     // Ожидается ручной запрос
   uint32_t manualRequestAtMs;    // Когда можно делать ручной запрос
+  uint32_t manualRequestDeadlineMs; // До какого момента ручной запрос может ждать условий, иначе отменяем с ошибкой
+  uint32_t manualStableSinceMs;     // С какого времени поток считается непрерывно стабильным для low-buffer manual retry
+  /** Установлен в on_ticker перед fetchFact: true = ручной запрос (не подменять AI→iTunes на FLAC). */
+  bool _pendingFetchIsManual;
+  /** Увеличивается при смене станции/трека; не сбрасывать isRequestInProgress там — иначе CoverDL параллелит TLS с FactsTask → -32512. */
+  uint32_t _factsSslEpoch;
 
   // === Failover (Отказоустойчивость) ===
   // Если пользователь выбрал провайдера, требующего ключ, но ключ не задан,
   // система автоматически переключается на MusicBrainz и уведомляет пользователя.
   bool _failoverActive;               // Флаг: работает ли failover (переключено на MusicBrainz)
   bool _failoverNotified;             // Флаг: уведомление уже показано пользователю (показываем 1 раз)
+  uint32_t _suppressFailoverToastUntilMs; // Не показывать тост «нет ключа» до этого времени (ввод ключа в настройках)
   void checkFailover();               // Проверка необходимости failover перед каждым запросом
 
   // [v0.4.1] Массив провайдеров — создаются в конструкторе, индексированы по FactSource
@@ -112,7 +121,11 @@ private:
   // Индексный файл index.txt отслеживает все файлы для LRU-ротации
   static constexpr const char* FACTS_CACHE_DIR  = "/data/facts";
   static constexpr const char* FACTS_INDEX_PATH = "/data/facts/index.txt";
-  static constexpr size_t FACTS_CACHE_MAX_BYTES = 1 * 1024 * 1024; // 1 МБ лимит на папку
+#ifdef FACTS_CACHE_MAX_BYTES
+  static constexpr size_t FACTS_CACHE_MAX_BYTES_LIMIT = (size_t)FACTS_CACHE_MAX_BYTES;
+#else
+  static constexpr size_t FACTS_CACHE_MAX_BYTES_LIMIT = 1 * 1024 * 1024; // 1 МБ лимит на папку
+#endif
 
   // DJB2 хэш для генерации имени файла (аналогично coverHash из config.cpp)
   static uint32_t djb2Hash(const String& str);
@@ -146,6 +159,16 @@ private:
 
   // [v0.4.0] Основной метод запроса — делегирует провайдеру через FactProvider
   void fetchFact(const String& artist, const String& title);
+
+  // Обновляет окно "стабильного потока" для ручного low-buffer запроса.
+  // Логика: если поток WEB играет, буфер >= порога и есть регулярная активность, накапливаем время стабильности.
+  // Если любое условие нарушено — окно стабильности сбрасывается.
+  void updateManualStabilityWindow(uint32_t now);
+
+  // Проверка, можно ли запускать ручной запрос в режиме low-buffer retry.
+  // Возвращает true, если буфер >= 5% и поток стабилен непрерывно 10 секунд.
+  // При rejectReason != nullptr заполняет человекочитаемую причину отказа для toast в WebUI.
+  bool canRunManualLowBufferRetry(uint32_t now, String* rejectReason = nullptr) const;
 
   // Служебные методы
   void processMetadata();

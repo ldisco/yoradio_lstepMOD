@@ -16,6 +16,8 @@
 #include "../displays/dspcore.h"
 #include "../displays/widgets/widgetsconfig.h" //BitrateFormat
 #include "../plugins/TrackFacts/TrackFacts.h"
+#include "../plugins/SleepTimer/SleepTimer.h"
+#include "../displays/tools/l10n.h"
 #include "config.h" // scheduleChangeModeTask
 
 #if DSP_MODEL==DSP_DUMMY
@@ -30,7 +32,11 @@
 #endif
 #ifndef NSQ_SEND_DELAY
   //#define NSQ_SEND_DELAY       portMAX_DELAY
-  #define NSQ_SEND_DELAY       pdMS_TO_TICKS(50)  // [FIX] Уменьшено для отзывчивости
+  // [FIX][SD+WEB] Для requestOnChange используем неблокирующую постановку в очередь.
+  // Причина: при reconnect-шторме WebSocket очередь может кратковременно заполняться,
+  // и блокировка на 50мс в xQueueSend() тормозила основной цикл/аудио.
+  // Нулевой timeout безопаснее: событие лучше пропустить, чем подвесить поток воспроизведения.
+  #define NSQ_SEND_DELAY       0
 #endif
 #ifndef NS_QUEUE_TICKS
   //#define NS_QUEUE_TICKS pdMS_TO_TICKS(2)
@@ -390,8 +396,18 @@ webserver.on("/api/current-cover", HTTP_GET, [](AsyncWebServerRequest *request) 
     extern Player player;          
     extern String metaTitle;       // Наша новая переменная из config.cpp
   
-    // 1. Определяем заголовок для поиска обложки (песня или имя файла)
-    String displayTitle = (metaTitle.length() > 0) ? metaTitle : String(config.station.name);
+    // 1. Заголовок для обложки / поля title в JSON для cover.js (iTunes поиск).
+    // Важно: как в 0.8.92 — приоритет у metaTitle. Иначе при station.title == const_PlConnect
+    // подмена на строку «Подключение…» шла РАНЬШЕ metaTitle и ломала title в /api/current-cover.
+    String displayTitle;
+    if (metaTitle.length() > 0) {
+      displayTitle = metaTitle;
+    } else if (config.getMode() == PM_WEB && config.station.title[0] != '\0' &&
+               strcmp(config.station.title, LANG::const_PlConnect) == 0) {
+      displayTitle = String(LANG::const_PlConnect);
+    } else {
+      displayTitle = String(config.station.name);
+    }
     String coverTitle = displayTitle;
     if (config.getMode() == PM_SDCARD) {
       // [FIX] Удаляем расширение файла и числовые префиксы для лучшего поиска в iTunes.
@@ -446,8 +462,11 @@ webserver.on("/api/current-cover", HTTP_GET, [](AsyncWebServerRequest *request) 
     }
     
     // [FIX] Если планируется загрузка с iTunes, проверяем наличие в локальном кэше ПЕРЕД отправкой ответа.
-    // Если в кэше уже есть — отдаём её URL сразу, не дожидаясь фоновой задачи в браузере.
-    if (WEBUI_COVERS_ENABLE && effectiveUrl == "SEARCH_ITUNES") {
+    // Если в кэше уже есть — отдаём её URL сразу.
+    //
+    // Важно: когда Display Cover OFF, ESP не должна тратить ресурсы на чтение/использование cache —
+    // в этом режиме пусть браузер делает iTunes сам (см. cover.js).
+    if (WEBUI_COVERS_ENABLE && effectiveUrl == "SEARCH_ITUNES" && isDisplayCoversEnabled()) {
         String key = String("ITUNES:") + coverTitle;
         // Используем статический кэш в config.cpp внутри coverCacheExists для минимизации VFS вызовов.
         extern bool coverCacheExists(const String& key);
@@ -457,9 +476,38 @@ webserver.on("/api/current-cover", HTTP_GET, [](AsyncWebServerRequest *request) 
         }
     }
 
+    // TFT: показ обложек выключен — если у нас нет ни кэша, ни выбранной картинки,
+    // веб может показать icy-logo по прямой ссылке. Если же currentCoverUrl уже на треке/кэше,
+    // не перетираем его.
+    if (WEBUI_COVERS_ENABLE && !isDisplayCoversEnabled() && effectiveUrl == "/logo.svg" && player.status() == PLAYING) {
+      extern String streamCoverUrl;
+      bool haveDirectIcyLogo = false;
+      if (streamCoverUrl.length() > 8) {
+        String sc = streamCoverUrl;
+        sc.trim();
+        if (sc.startsWith("http://") || sc.startsWith("https://")) {
+          effectiveUrl = sc;
+          haveDirectIcyLogo = true;
+        }
+      }
+
+      // Если прямого icy-logo нет — включаем клиентский iTunes через cover.js.
+      // В этом режиме ESP не будет кэшировать обложки (CoverDL отключён).
+      if (!haveDirectIcyLogo) {
+        String coverTitleLower = coverTitle;
+        coverTitleLower.toLowerCase();
+        extern volatile bool g_modeSwitching;
+        if (!g_modeSwitching && coverTitle.length() >= 3 && !coverTitle.startsWith("[") &&
+            coverTitleLower.indexOf("timeout") < 0) {
+          effectiveUrl = "SEARCH_ITUNES";
+        }
+      }
+    }
+
     // 3. Формируем JSON (Важно: ТРИ поля %s для ТРЕХ переменных)
+    // [FIX] Ограничиваем длину полей (%.128s), иначе url+station+title по 250 байт переполняют json[512].
         char json[512];
-        snprintf(json, sizeof(json), "{\"url\":\"%s\",\"station\":\"%s\",\"title\":\"%s\"}", 
+        snprintf(json, sizeof(json), "{\"url\":\"%.128s\",\"station\":\"%.128s\",\"title\":\"%.128s\"}", 
           effectiveUrl.c_str(), 
           config.station.name,
           coverTitle.c_str()); // Теперь всё на своих местах
@@ -482,7 +530,15 @@ webserver.on("/api/current-fact", HTTP_GET, [](AsyncWebServerRequest *request) {
   extern TrackFacts trackFactsPlugin;
     
     String fact = currentFact.length() > 0 ? currentFact : "";
-    String title = metaTitle.length() > 0 ? metaTitle : String(config.station.name);
+    String title;
+    if (config.getMode() == PM_WEB && config.station.title[0] != '\0' &&
+        strcmp(config.station.title, LANG::const_PlConnect) == 0) {
+      title = String(LANG::const_PlConnect);
+    } else if (metaTitle.length() > 0) {
+      title = metaTitle;
+    } else {
+      title = String(config.station.name);
+    }
     String status = "";
 
     // [FIX] Служебные сообщения не считаем фактом — отдаем их отдельно в поле status.
@@ -760,7 +816,8 @@ void NetServer::processQueue(){
   // В SD‑режиме при активном WebUI очередь могла копиться быстрее, чем
   // обрабатываться, и из‑за дополнительного ограничения в requestOnChange()
   // обновления для браузера просто переставали попадать в очередь —
-
+  // визуально «умирал» Web, хотя система продолжала работать.
+  //
   // Новый подход:
   //  - лимит делаем более гибким и чуть выше (24);
   //  - при желании можно будет дополнительно адаптировать его под Heap/режим.
@@ -773,11 +830,14 @@ void NetServer::processQueue(){
     wsBuf[0]='\0';
     switch (request.type) {
       case PLAYLIST:        getPlaylist(clientId); break;
+      // [FIX] Только обновить плейлист у клиентов, БЕЗ перестройки индекса. Вызывается из FavUpdate после setFavorite:
+      // позиции строк в плейлисте не меняются (меняется только 5-я колонка 0/1), indexSDPlaylistFile() не нужен
+      // и блокировал main loop на десятки секунд при 3000+ треках → веб «умирал», FREEZE-RECOVERY.
+      case PLAYLIST_UPDATED: getPlaylist(clientId); break;
       case PLAYLISTSAVED:   {
         #ifdef USE_SD
         if(config.getMode()==PM_SDCARD) {
-          // [FIX] Перестраиваем индекс из файла, НЕ сканируем SD заново.
-          // sdman.indexSDPlaylist() затирал избранные и жанры!
+          // Перестройка индекса только при полном сохранении/импорте плейлиста (не при setFavorite).
           config.indexSDPlaylistFile();
         }
         #endif
@@ -840,6 +900,8 @@ void NetServer::processQueue(){
           requestOnChange(SDINIT, clientId);
           requestOnChange(GETPLAYERMODE, clientId); 
           if (config.getMode()==PM_SDCARD) { requestOnChange(SDPOS, clientId); requestOnChange(SDLEN, clientId); requestOnChange(SDSNUFFLE, clientId); } 
+          // Таймер сна: pushState при старте мог уйти в пустой эфир — досылаем подключившемуся клиенту.
+          sleepTimerPlugin.pushState(clientId);
           return; 
           break;
         }
@@ -855,10 +917,12 @@ void NetServer::processQueue(){
                                   config.store.telnet,
                                   config.store.watchdog); 
                                   break;
-      case GETSCREEN:     snprintf (wsBuf, sizeof(wsBuf), "{\"flip\":%d,\"inv\":%d,\"nump\":%d,\"tsf\":%d,\"tsd\":%d,\"dspon\":%d,\"br\":%d,\"con\":%d,\"scre\":%d,\"scrt\":%d,\"scrb\":%d,\"scrpe\":%d,\"scrpt\":%d,\"scrpb\":%d}", 
+      case GETSCREEN:     snprintf (wsBuf, sizeof(wsBuf), "{\"flip\":%d,\"inv\":%d,\"nump\":%d,\"coven\":%d,\"covopt\":%d,\"tsf\":%d,\"tsd\":%d,\"dspon\":%d,\"br\":%d,\"con\":%d,\"scre\":%d,\"scrt\":%d,\"scrb\":%d,\"scrpe\":%d,\"scrpt\":%d,\"scrpb\":%d}", 
                                   config.store.flipscreen, 
                                   config.store.invertdisplay, 
                                   config.store.numplaylist, 
+                                  isDisplayCoversEnabled(),
+                                  isDisplayCoversAllowedByBuild(),
                                   config.store.fliptouch, 
                                   config.store.dbgtouch, 
                                   config.store.dspon, 
@@ -906,22 +970,50 @@ void NetServer::processQueue(){
                                   break;
       case DSPON:         snprintf (wsBuf, sizeof(wsBuf), "{\"dspontrue\":%d}", 1); break;
       case STATION:       requestOnChange(STATIONNAME, clientId); requestOnChange(ITEM, clientId); break;
-      case STATIONNAME:   snprintf (wsBuf, sizeof(wsBuf), "{\"payload\":[{\"id\":\"nameset\", \"value\": \"%s\"}]}", config.station.name); break;
+      case STATIONNAME: {
+        // Во время индексации SD не показываем старую веб-станцию — только статус индексации.
+        if (config.sdIndexing) {
+          snprintf(wsBuf, sizeof(wsBuf), "{\"payload\":[{\"id\":\"nameset\", \"value\": \"%s\"}]}", "Индексация SD...");
+        } else if (config.getMode() == PM_SDCARD) {
+          // В SD-режиме не шлём старый nameset с веб-радио: берём имя из плейлиста SD или "SD".
+          uint16_t idx = config.lastStation();
+          uint16_t plen = config.playlistLength();
+          const char* nm = (plen > 0 && idx >= 1 && idx <= plen) ? config.stationByNum(idx) : "SD";
+          snprintf(wsBuf, sizeof(wsBuf), "{\"payload\":[{\"id\":\"nameset\", \"value\": \"%.200s\"}]}", nm ? nm : "SD");
+        } else {
+          snprintf(wsBuf, sizeof(wsBuf), "{\"payload\":[{\"id\":\"nameset\", \"value\": \"%s\"}]}", config.station.name);
+        }
+        break;
+      }
       case ITEM:          snprintf (wsBuf, sizeof(wsBuf), "{\"current\": %d}", config.lastStation()); break;
-      case TITLE:         snprintf (wsBuf, sizeof(wsBuf), "{\"payload\":[{\"id\":\"meta\", \"value\": \"%s\"}]}", config.station.title); break;
+      case TITLE: {
+        // Во время индексации SD не показываем тег предыдущей веб-станции — только статус индексации.
+        extern String metaTitle;
+        if (config.sdIndexing) {
+          snprintf(wsBuf, sizeof(wsBuf), "{\"payload\":[{\"id\":\"meta\", \"value\": \"%s\"}]}", "Индексация SD...");
+        } else if (config.getMode() == PM_SDCARD) {
+          // В SD-режиме не шлём старый meta с веб-радио: текущий трек из metaTitle или "Загрузка плейлиста...".
+          const char* tit = (metaTitle.length() > 0) ? metaTitle.c_str() : "Загрузка плейлиста...";
+          snprintf(wsBuf, sizeof(wsBuf), "{\"payload\":[{\"id\":\"meta\", \"value\": \"%.200s\"}]}", tit);
+        } else {
+          snprintf(wsBuf, sizeof(wsBuf), "{\"payload\":[{\"id\":\"meta\", \"value\": \"%s\"}]}", config.station.title);
+        }
+        break;
+      }
       // [Gemini3Pro] Remap 0-254 (Internal) to 0-100 (WebUI)
       case VOLUME:        snprintf (wsBuf, sizeof(wsBuf), "{\"payload\":[{\"id\":\"volume\", \"value\": %d}]}", (config.store.volume * 100) / 254); telnet.printf("##CLI.VOL#: %d\n", config.store.volume); break;
       // [Gemini3Pro] Добавлена проверка playerBufMax > 0 для защиты от деления на ноль
-      case NRSSI:         snprintf (wsBuf, sizeof(wsBuf), "{\"payload\":[{\"id\":\"rssi\", \"value\": %d}, {\"id\":\"heap\", \"value\": %d}]}", rssi, (player.isRunning() && config.store.audioinfo && playerBufMax > 0)?(int)(100*player.inBufferFilled()/playerBufMax):0); /*rssi = 255;*/ break;
+      // Процент буфера считаем от реального размера (player.getInBufferSize()), как в [DIAG], чтобы веб/дисплей совпадали с логом.
+      case NRSSI:         { uint32_t total = player.getInBufferSize(); int heapPct = (player.isRunning() && config.store.audioinfo && total > 0) ? (int)(100*player.inBufferFilled()/total) : 0; snprintf (wsBuf, sizeof(wsBuf), "{\"payload\":[{\"id\":\"rssi\", \"value\": %d}, {\"id\":\"heap\", \"value\": %d}]}", rssi, heapPct); } break;
       case SDPOS:         {
-                                  // [FIX] Проверка isRunning(), чтобы не вызывать методы аудио, когда поток не активен/ошибочен.
-                                  // getFilePos/getFileSize могут блокировать выполнение при определенных ошибках LittleFS/SD.
-                                  bool running = player.isRunning();
+                                  // Вызывать getFilePos/getFileSize только в SD-режиме — иначе "audio is not a file" при переходе SD->WEB
+                                  // (запрос мог остаться в очереди до смены режима).
+                                  bool running = (config.getMode() == PM_SDCARD) && player.isRunning();
                                   snprintf (wsBuf, sizeof(wsBuf), "{\"sdpos\": %lu,\"sdend\": %lu,\"sdtpos\": %lu,\"sdtend\": %lu}", 
-                                  running ? player.getFilePos() : 0, 
-                                  running ? player.getFileSize() : 0, 
-                                  running ? player.getAudioCurrentTime() : 0, 
-                                  running ? player.getAudioFileDuration() : 0); 
+                                  running ? player.getFilePos() : 0u, 
+                                  running ? player.getFileSize() : 0u, 
+                                  running ? player.getAudioCurrentTime() : 0u, 
+                                  running ? player.getAudioFileDuration() : 0u); 
                                   }
                                   break;
       case SDLEN:         snprintf (wsBuf, sizeof(wsBuf), "{\"sdmin\": %lu,\"sdmax\": %lu}", player.sd_min, player.sd_max); break;
@@ -935,6 +1027,21 @@ void NetServer::processQueue(){
       case SDINDEXING:    snprintf (wsBuf, sizeof(wsBuf), "{\"sdindexing\": %d}", config.sdIndexing ? 1 : 0); break;
       #ifdef USE_SD
         case CHANGEMODE: {
+          {
+            FILE* f = fopen("debug-0da86f.log", "a");
+            if (f) {
+              // #region agent log
+              fprintf(
+                f,
+                "{\"sessionId\":\"0da86f\",\"runId\":\"run1\",\"hypothesisId\":\"H5\",\"location\":\"netserver.cpp:processQueue:CHANGEMODE\",\"message\":\"web requested mode switch\",\"data\":{\"newConfigMode\":%d,\"currentMode\":%d},\"timestamp\":%lu}\n",
+                (int)config.newConfigMode,
+                (int)config.getMode(),
+                (unsigned long)millis()
+              );
+              // #endregion
+              fclose(f);
+            }
+          }
           // КРИТИЧНО: переключение режима может быть «тяжёлым» (SD mount / индексация).
           // Если вызвать config.changeMode() прямо здесь, мы блокируем обработку WebSocket очереди,
           // и браузер (особенно телефон) получает таймауты и перестаёт обновляться.
@@ -955,11 +1062,17 @@ void NetServer::processQueue(){
       if (clientId == 0 && request.type == VOLUME) mqttPublishVolume();
   #endif
     }
+    // Состояние таймера сна не входит в JSON GETSYSTEM — отдельным сообщением, иначе UI не знает supported/alloff.
+    if (request.type == GETSYSTEM) {
+      sleepTimerPlugin.pushState(clientId);
+    }
   }
 }
 
 void NetServer::loop() {
-  if(network.status==SDREADY) return;
+  // [FIX] Убран early return при SDREADY: при нём не вызывались processQueue(), pingAll(), cleanupClients(),
+  // из-за чего веб переставал получать обновления и «умирал» при работе в SD с WiFi (после потери WiFi status=SDREADY).
+  // В main-ветке этого return не было — обработка очереди и keepalive должны выполняться всегда.
 
   // [HEARTBEAT] Убрали периодический вывод в консоль Free Heap и размера очереди, 
   // чтобы не мешать логам индексации SD и не переполнять Serial при активных запросах.
@@ -977,20 +1090,26 @@ void NetServer::loop() {
     ESP.restart();
   }
   processQueue();
-  // [FIX] Периодический WebSocket keepalive: при занятости core1 (аудио-реконнект, декодер)
-  // очередь nsQueue может не обрабатываться, клиент не получает rssi и через 15 сек закрывает сокет.
-  // Отправляем pong раз в 8 сек независимо от очереди — веб-интерфейс не «зависает».
+  // [FIX][SD+WEB] Периодический ПРОТОКОЛЬНЫЙ keepalive для WebSocket.
+  // Ранее отправляли текстовый JSON {"pong":1}, но это не WebSocket ping frame.
+  // На части мобильных клиентов сокет всё равно уходил в rx timeout (AsyncTCP _poll timeout 4)
+  // при отсутствии входящего трафика от браузера.
+  //
+  // Теперь шлём именно pingAll(), чтобы клиент отвечал pong на уровне протокола WS.
+  // Это снижает вероятность "тихого" отвала Web при SD-проигрывании.
   static uint32_t lastWsKeepalive = 0;
-  if (websocket.count() > 0 && (millis() - lastWsKeepalive >= 8000)) {
+  if (websocket.count() > 0 && (millis() - lastWsKeepalive >= 5000)) {
     lastWsKeepalive = millis();
-    websocket.textAll("{\"pong\":1}");
+    websocket.pingAll();
   }
-  // [FIX] cleanupClients() вызывается раз в 500мс — агрессивнее закрываем "мёртвых" клиентов
-  // чтобы быстрее освобождать TCP-сокеты при подключении нового устройства (телефон/ПК)
+  // [FIX][SD+WEB] Не ограничиваем количество клиентов через cleanupClients(2).
+  // Ранее лимит "2" вызывал каскадные disconnect/reconnect (особенно при входе с телефона),
+  // что совпадало с таймаутами AsyncTCP и визуальной "смертью" WebUI.
+  // Оставляем только чистку реально мёртвых сокетов без принудительного выталкивания активных.
   static uint32_t lastCleanup = 0;
-  if(millis() - lastCleanup > 500) {
+  if(millis() - lastCleanup > 2000) {
     lastCleanup = millis();
-    websocket.cleanupClients(2);
+    websocket.cleanupClients();
   }
   switch (importRequest) {
     case IMPL:    importPlaylist();  importRequest = IMDONE; break;
@@ -998,6 +1117,12 @@ void NetServer::loop() {
     default:      break;
   }
   //processQueue();
+}
+
+void NetServer::sendToast(const char* msg, bool isError) {
+  if (!msg || !msg[0]) return;
+  snprintf(wsBuf, sizeof(wsBuf), "{\"toast\":\"%s\",\"isErr\":%d}", msg, isError ? 1 : 0);
+  websocket.textAll(wsBuf);
 }
 
 #if IR_PIN!=255
@@ -1026,7 +1151,7 @@ void NetServer::onWsMessage(void *arg, uint8_t *data, size_t len, uint8_t client
     size_t safeLen = (len >= sizeof(local)) ? sizeof(local) - 1 : len;
     memcpy(local, data, safeLen);
     local[safeLen] = 0;
-    if (config.parseWsCommand(local, _wscmd, _wsval, 128)) {
+    if (config.parseWsCommand(local, _wscmd, sizeof(_wscmd), _wsval, sizeof(_wsval))) {
       if (strcmp(_wscmd, "ping") == 0) {
         websocket.text(clientId, "{\"pong\": 1}");
         return;
@@ -1056,7 +1181,13 @@ void NetServer::onWsMessage(void *arg, uint8_t *data, size_t len, uint8_t client
         return;
       }
       
+      uint32_t _wsCmdStartMs = millis();
       if(cmd.exec(_wscmd, _wsval, clientId)){
+        uint32_t _wsCmdElapsedMs = millis() - _wsCmdStartMs;
+        if (_wsCmdElapsedMs >= 500) {
+          Serial.printf("[WS-DIAG] cmd='%s' client=%u handled in %lu ms\n",
+                        _wscmd, (unsigned)clientId, (unsigned long)_wsCmdElapsedMs);
+        }
         return;
       }
     }
@@ -1140,7 +1271,13 @@ void NetServer::requestOnChange(requestType_e request, uint8_t clientId) {
   if(nsQueue==NULL) return;
   // Ранее здесь была жёсткая отсечка:
   //   if(uxQueueSpacesAvailable(nsQueue) < 4) return;
-//добавляем только мягкую защиту «очевидного переполнения» —
+  // Идея была в том, чтобы «оставить место для важных команд», но на практике
+  // в SD‑режиме при активном WebUI очередь часто оказывалась «почти полной»,
+  // и обновления состояния (VUmeter, позиция трека, режим и т.п.)
+  // просто не попадали в очередь. В результате WebUI переставал получать данные
+  // и визуально «умирал», хотя устройство продолжало играть и отвечать.
+  //
+  // Новый подход: добавляем только мягкую защиту «очевидного переполнения» —
   // не шлём запрос, если в очереди НЕТ свободных слотов вообще.
   UBaseType_t freeSlots = uxQueueSpacesAvailable(nsQueue);
   if (freeSlots == 0) {
@@ -1154,9 +1291,14 @@ void NetServer::requestOnChange(requestType_e request, uint8_t clientId) {
   if (inRequest) return;
   inRequest = true;
 
+  // [FIX][SD+WEB] Формируем событие для WebSocket-очереди.
   nsRequestParams_t nsrequest;
+  // [FIX][SD+WEB] Сохраняем тип изменения (meta, sdpos, mode и т.д.).
   nsrequest.type = request;
+  // [FIX][SD+WEB] Сохраняем целевой clientId (0 = broadcast всем клиентам).
   nsrequest.clientId = clientId;
+  // [FIX][SD+WEB] Неблокирующая отправка: при переполнении просто пропускаем событие,
+  // чтобы не блокировать поток, который вызвал requestOnChange (критично для плавного SD-аудио).
   xQueueSend(nsQueue, &nsrequest, NSQ_SEND_DELAY);
 
   inRequest = false;
@@ -1264,7 +1406,14 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
       // JS сам пошлёт getindex=1 после загрузки player.html (continueLoading).
       // Ранее серверный GETINDEX + клиентский getindex=1 вызывали двойную загрузку
       // плейлиста (/api/playlist), что исчерпывало TCP-сокеты на мобильных.
-      if (config.store.audioinfo) Serial.printf("[WEBSOCKET] client #%lu connected from %s\n", client->id(), config.ipToStr(client->remoteIP()));
+      if (config.store.audioinfo) {
+        IPAddress rip = client->remoteIP();
+        // Сразу после accept remoteIP() иногда ещё 0.0.0.0 — не ошибка клиента.
+        if (rip == IPAddress(0, 0, 0, 0))
+          Serial.printf("[WEBSOCKET] client #%lu connected (IP pending)\n", client->id());
+        else
+          Serial.printf("[WEBSOCKET] client #%lu connected from %s\n", client->id(), config.ipToStr(rip));
+      }
       break;
     case WS_EVT_DISCONNECT: if (config.store.audioinfo) Serial.printf("[WEBSOCKET] client #%lu disconnected\n", client->id()); break;
     case WS_EVT_DATA: netserver.onWsMessage(arg, data, len, client->id()); break;
@@ -1385,12 +1534,15 @@ void handleIndex(AsyncWebServerRequest * request) {
     }
 #endif
   if (strcmp(request->url().c_str(), "/") == 0 && request->params() == 0) {
-    if(network.status == CONNECTED) {
+    // [FIX] Отдаём плеер (index) при CONNECTED и при SDREADY (SD без WiFi — пользователь вводит IP для плеера).
+    // Редирект на settings только когда реально нужна настройка (AP/нет сети), а не при работе в SD.
+    if (network.status == CONNECTED || network.status == SDREADY) {
       AsyncWebServerResponse *response = request->beginResponse_P(200, "text/html", index_html);
       response->addHeader("Cache-Control","max-age=31536000");
       request->send(response);
-      //request->send_P(200, "text/html", index_html); 
-    } else request->redirect("/settings.html");
+    } else {
+      request->redirect("/settings.html");
+    }
     return;
   }
   if(network.status == CONNECTED){

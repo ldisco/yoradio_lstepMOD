@@ -14,6 +14,9 @@
 
  ****************************************************************************************/
 #include "../core/options.h"
+#if AUDIO_STREAM_DIAG
+#include <WiFi.h>
+#endif
 
 #if VS1053_CS==255
 #include "../core/config.h"
@@ -25,15 +28,16 @@
 #include "vorbis_decoder/vorbis_decoder.h"
 #include "psram_unique_ptr.hpp"
 
-// Безопасный connect: выполняем сетевую операцию в TCPIP-потоке через tcpip_callback,
-// чтобы избежать создания UDP PCB вне TCPIP core (lwIP assert).
-// Чтобы временно отключить эту защиту (например, для отладки), закомментируйте
-// следующую строку и восстановится прежнее поведение (прямой вызов connect()).
-#define AUDIO_SAFE_TCPIP_CONNECT
-
+// Опционально: LOCK_TCPIP_CORE() вокруг connect() (см. ниже #if) — только если снова поймаете
+// редкий lwIP assert "Required to lock TCPIP core". По умолчанию выкл.: как в оригинале — прямой connect.
+//#define AUDIO_SAFE_TCPIP_CONNECT
+#if defined(AUDIO_SAFE_TCPIP_CONNECT)
 extern "C" {
+#include "lwip/opt.h"
 #include "lwip/tcpip.h"
 }
+#endif
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
@@ -727,44 +731,13 @@ bool Audio::connecttohost(const char* host, const char* user, const char* pwd) {
 
     AUDIO_INFO("connect to: \"%s\" on port %d path \"/%s\"", hwoe.get(), port, path.get());
 
-/*#if defined(AUDIO_SAFE_TCPIP_CONNECT)
-    // Контекст для вызова в TCPIP-потоке — можно закомментировать макрос выше
-    struct ConnectCtx {
-        NetworkClient* client;
-        const char* host;
-        uint16_t port;
-        bool result;
-        SemaphoreHandle_t sem;
-    } ctx;
-
-    ctx.client = m_client;
-    ctx.host = hwoe.get();
-    ctx.port = port;
-    ctx.result = false;
-    ctx.sem = xSemaphoreCreateBinary();
-    if (ctx.sem == NULL) {
-        AUDIO_ERROR("tcpip sem create failed");
-        res = false;
-    } else {
-        // Выполнить connect() в TCPIP-потоке и дождаться результата
-        auto cb = [](void* arg) {
-            ConnectCtx* c = reinterpret_cast<ConnectCtx*>(arg);
-            if (c && c->client) {
-                c->result = c->client->connect(c->host, c->port);
-            }
-            xSemaphoreGive(c->sem);
-        };
-        tcpip_callback(cb, &ctx);
-        if (xSemaphoreTake(ctx.sem, pdMS_TO_TICKS(m_f_ssl ? m_timeout_ms_ssl : m_timeout_ms)) == pdTRUE) {
-            res = ctx.result;
-        } else {
-            res = false;
-        }
-        vSemaphoreDelete(ctx.sem);
-    }
-#else*/
+#if defined(AUDIO_SAFE_TCPIP_CONNECT)
+    LOCK_TCPIP_CORE();
     res = m_client->connect(hwoe.get(), port);
-//#endif
+    UNLOCK_TCPIP_CORE();
+#else
+    res = m_client->connect(hwoe.get(), port);
+#endif
 
     m_expectedCodec = CODEC_NONE;
     m_expectedPlsFmt = FORMAT_NONE;
@@ -3991,14 +3964,39 @@ void Audio::processWebStream() {
     }
 
     // buffer fill routine - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-    if(m_pwst.availableBytes) {
-        m_pwst.availableBytes = min(m_pwst.availableBytes, (uint32_t)InBuff.writeSpace());
-        int32_t bytesAddedToBuffer = audioFileRead(InBuff.getWritePtr(), min(m_pwst.availableBytes, UINT16_MAX));
-        if(bytesAddedToBuffer > 0) {
-            if(m_f_metadata) m_metacount -= bytesAddedToBuffer;
-            if(m_f_chunked) m_pwst.chunkSize -= bytesAddedToBuffer;
-            InBuff.bytesWritten(bytesAddedToBuffer);
-            if(audio_stream_activity) audio_stream_activity(); // Watchdog: поток жив
+    // [FIX] Не вызываем audioFileRead при разорванном соединении — снижает риск assert pbuf_free в lwIP.
+    if(m_pwst.availableBytes && m_client->connected()) {
+#if AUDIO_READ_HEAP_GUARD_ENABLE
+        // [FIX] Мягкая анти-гонка для связки audio read + параллельный SSL:
+        // если heap временно просел ниже порога, не читаем сокет в этой итерации.
+        // Это уменьшает «пиковую» конкуренцию за сетевой стек и освобождение pbuf.
+        uint32_t freeHeapNow = ESP.getFreeHeap();
+        if(freeHeapNow < (uint32_t)AUDIO_READ_HEAP_GUARD_MIN_HEAP) {
+#if AUDIO_READ_HEAP_GUARD_LOG
+            // Лог выводим с rate-limit, чтобы диагностика не зашумляла монитор.
+            static uint32_t lastHeapGuardLog = 0;
+            uint32_t now = millis();
+            if((now - lastHeapGuardLog) >= 5000) {
+                lastHeapGuardLog = now;
+                AUDIO_INFO("[HEAP-GUARD] skip read: heap=%lu < %u, delay=%u ms",
+                           (unsigned long)freeHeapNow,
+                           (unsigned)AUDIO_READ_HEAP_GUARD_MIN_HEAP,
+                           (unsigned)AUDIO_READ_HEAP_GUARD_DELAY_MS);
+            }
+#endif
+            vTaskDelay(pdMS_TO_TICKS(AUDIO_READ_HEAP_GUARD_DELAY_MS));
+        } else
+#endif
+        {
+            m_pwst.availableBytes = min(m_pwst.availableBytes, (uint32_t)InBuff.writeSpace());
+            // Лимит чтения за тик повышает отзывчивость WebUI и снижает риск сетевых таймаутов.
+            int32_t bytesAddedToBuffer = audioFileRead(InBuff.getWritePtr(), min(m_pwst.availableBytes, (uint32_t)4096));
+            if(bytesAddedToBuffer > 0) {
+                if(m_f_metadata) m_metacount -= bytesAddedToBuffer;
+                if(m_f_chunked) m_pwst.chunkSize -= bytesAddedToBuffer;
+                InBuff.bytesWritten(bytesAddedToBuffer);
+                if(audio_stream_activity) audio_stream_activity(); // Watchdog: поток жив
+            }
         }
     }
 
@@ -4051,7 +4049,8 @@ void Audio::processWebFile() {
     }*/
 
     m_pwf.availableBytes = min(m_client->available(), InBuff.writeSpace());
-    m_pwf.bytesAddedToBuffer = audioFileRead(InBuff.getWritePtr(), min(m_pwf.availableBytes, UINT16_MAX));
+    // Для web-file применяем тот же лимит чтения за итерацию, что и для web-stream.
+    m_pwf.bytesAddedToBuffer = audioFileRead(InBuff.getWritePtr(), min(m_pwf.availableBytes, (uint32_t)4096));
     if(m_pwf.bytesAddedToBuffer > 0) {
         InBuff.bytesWritten(m_pwf.bytesAddedToBuffer);
         if(audio_stream_activity) audio_stream_activity(); // Watchdog: поток жив
@@ -4444,7 +4443,9 @@ bool Audio::parseHttpResponseHeader() { // this is the response to a GET / reque
 
     memset(&m_phreh, 0, sizeof(m_phreh));
     m_phreh.ctime = millis();
-    m_phreh.timeout = 4500; // ms	(HEADER_TIMEOUT))
+    // [FIX] Ограниченный таймаут: при «мёртвой» станции быстрее сдаёмся, веб и весь функционал не должны зависать.
+    // Внутри цикла — периодический yield, чтобы даже при медленном потоке не блокировать другие задачи.
+    m_phreh.timeout = 1500; // ms (HEADER_TIMEOUT)
 
     if(m_client->available() == 0) {
         if(!m_phreh.f_time) {
@@ -4484,6 +4485,8 @@ bool Audio::parseHttpResponseHeader() { // this is the response to a GET / reque
             if(b < 0x20) continue;
             rhl[pos] = b;
             pos++;
+            // Периодический yield: при «барахлящей» станции не монополизируем CPU — веб и UI остаются отзывчивыми.
+            if(pos > 0 && (pos % 32) == 0) vTaskDelay(pdMS_TO_TICKS(1));
             if(pos == 1023) {
                 pos = 1022;
                 continue;
@@ -4540,7 +4543,8 @@ bool Audio::parseHttpResponseHeader() { // this is the response to a GET / reque
                                 m_f_m3u8data = true;
                             }
                             httpPrint(c_host);
-                            while(m_client->available()) audioFileRead(); // empty client buffer
+                            // Очистка буфера с периодическим yield — не блокировать веб при большом объёме данных.
+                            { int n = 0; while(m_client->available()) { audioFileRead(); if(++n >= 64) { n = 0; vTaskDelay(pdMS_TO_TICKS(1)); } } }
                             return true;
                         }
                     }
@@ -4586,7 +4590,7 @@ bool Audio::parseHttpResponseHeader() { // this is the response to a GET / reque
             icyLogo.trim();
             if(icyLogo.strlen() > 0){
                 AUDIO_INFO("icy-logo: %s", icyLogo.get());
-//                info(evt_icylogo, icyLogo.get());
+                if(audio_icylogo) audio_icylogo(icyLogo.get());
             }
         }
 
@@ -4598,10 +4602,8 @@ bool Audio::parseHttpResponseHeader() { // this is the response to a GET / reque
             else m_phreh.bitrate = c_bitRate.to_uint32(10);
             m_nominal_bitrate = c_bitRate.to_uint32(10);
             AUDIO_INFO("icy-bitrate : %lu (b/s)", m_nominal_bitrate);
-//            info(evt_bitrate, c_bitRate.c_get());
-//            AUDIO_INFO("BitRate: %lu", m_nominal_bitrate);
-//            audio_bitrate(c_bitRate.c_get());
-//            audio_bitrate(m_nominal_bitrate);
+            // Передаём битрейт в UI/дисплей через callback (формат строки как в setDecoderItems).
+            AUDIO_INFO("BitRate: %lu", m_nominal_bitrate);
         }
 
         else if(rhl.starts_with_icase("icy-metaint:")) {
@@ -4661,7 +4663,7 @@ bool Audio::parseHttpResponseHeader() { // this is the response to a GET / reque
         else if(rhl.starts_with_icase("icy-url:")) {
             char* icyurl = (rhl.get() + 8);
             trim(icyurl);
-//            /*info(evt_icyurl,*/ audio_icyurl(icyurl);
+            if(audio_icyurl) audio_icyurl(icyurl);
         }
 
         else if(rhl.starts_with_icase("www-authenticate:")) {
@@ -4721,7 +4723,7 @@ bool Audio::parseHttpRangeHeader() { // this is the response to a Range request
     }
 
     m_phrah.ctime = millis();
-    m_phrah.timeout = 4500; // ms
+    m_phrah.timeout = 1500; // ms — как в parseHttpResponseHeader: не блокировать веб при «мёртвой» станции
 
     if(m_client->available() == 0) {
         if(!m_phrah.f_time) {
@@ -4757,6 +4759,7 @@ bool Audio::parseHttpRangeHeader() { // this is the response to a Range request
             if(b < 0x20) continue;
             rhl[pos] = b;
             pos++;
+            if(pos > 0 && (pos % 32) == 0) vTaskDelay(pdMS_TO_TICKS(1));
             if(pos == 1023) {
                 pos = 1022;
                 continue;
@@ -5735,6 +5738,9 @@ int32_t Audio::audioFileRead(uint8_t* buff, size_t len){
     if(buff && len == 0) return 0; // nothing to do
     int32_t readed_bytes = 0;
     uint32_t offset = 0;
+    // Ограничение размера одного сетевого чтения снижает пиковую нагрузку на lwIP
+    // и уменьшает риск нестабильности при параллельных сетевых задачах.
+    const size_t webReadChunkLimit = 2048;
     // This method standardized reading files, regardless of the source (local or web) and the correct number of the bytes read must be determined.
     int32_t res = -1;
 
@@ -5744,6 +5750,8 @@ int32_t Audio::audioFileRead(uint8_t* buff, size_t len){
             if(res >= 0) m_audioFilePosition ++;
         }
         else{
+            // [FIX] Не вызываем read() при уже разорванном соединении — снижает риск assert pbuf_free (lwIP ref)
+            if(!m_client->connected()) return -1;
             res = m_client->read();
             if(res >= 0) m_audioFilePosition ++;
         }
@@ -5757,7 +5765,12 @@ int32_t Audio::audioFileRead(uint8_t* buff, size_t len){
                 if(readed_bytes <= 0) break;
             }
             else{
-                readed_bytes = m_client->read(buff + offset, len);
+                // [FIX] Проверка connected() перед read() — избегаем read() на закрытом сокете, снижаем риск
+                // краша lwIP (pbuf_free: p->ref > 0) при гонке с фоновым закрытием соединения.
+                if(!m_client->connected()) break;
+                // Читаем из сокета порциями, чтобы не зависать надолго в одном цикле.
+                size_t readLen = min(len, webReadChunkLimit);
+                readed_bytes = m_client->read(buff + offset, readLen);
                 if(readed_bytes >= 0) {m_audioFilePosition += readed_bytes; len -= readed_bytes; offset += readed_bytes; res = offset; t = millis();}
                 if(readed_bytes <= 0) break; // vTaskDelay(5);
             }
@@ -6065,6 +6078,12 @@ void Audio::Gain(int16_t* sample) {
 uint32_t Audio::inBufferFilled() {
     // current audio input buffer fillsize in bytes
     return InBuff.bufferFilled();
+}
+//****************************************************************************************
+uint32_t Audio::getInBufferSize() {
+    // Возвращаем полный размер входного буфера (в байтах),
+    // чтобы внешние модули могли корректно считать процент заполнения.
+    return InBuff.getBufsize();
 }
 //****************************************************************************************
 /*uint32_t Audio::inBufferFree() {
@@ -6824,11 +6843,37 @@ exit:
 boolean Audio::streamDetection(uint32_t bytesAvail) {
     if(!m_lastHost.valid()) {AUDIO_ERROR("m_lastHost is empty"); return false;}
 
-    // if within one second the content of the audio buffer falls below the size of an audio frame 100 times,
-    // issue a message
+#if AUDIO_STREAM_DIAG
+    // Периодический вывод диагностики потока/сети в монитор (раз в 5 сек) для поиска причины фризов.
+    {
+        static uint32_t lastDiag = 0;
+        uint32_t now = millis();
+        if(lastDiag == 0 || now - lastDiag >= 5000) {
+            lastDiag = now;
+            size_t filled = InBuff.bufferFilled();
+            size_t total = InBuff.getBufsize();
+            unsigned pct = total ? (unsigned)((uint64_t)filled * 100 / total) : 0;
+            int rssi = -255;
+            if(WiFi.status() == WL_CONNECTED) rssi = WiFi.RSSI();
+            AUDIO_INFO("[DIAG] buf=%u/%u %u%% slow=%u lost=%u netAvail=%u heap=%lu rssi=%d",
+                (unsigned)filled, (unsigned)total, pct,
+                (unsigned)m_sdet.cnt_slow, (unsigned)m_sdet.cnt_lost,
+                (unsigned)bytesAvail, (unsigned long)ESP.getFreeHeap(), rssi);
+        }
+    }
+#endif
+
+    // Если в течение секунды буфер чаще 100 раз оказывался ниже одного блока — поток «медленный»,
+    // возможны дропауты. Сообщение выводим не чаще раза в 10 сек, чтобы не грузить Serial/telnet.
     if(m_sdet.tmr_slow + 1000 < millis()) {
         m_sdet.tmr_slow = millis();
-        if(m_sdet.cnt_slow > 100) AUDIO_INFO("slow stream, dropouts are possible");
+        if(m_sdet.cnt_slow > 100) {
+            static uint32_t lastSlowLog = 0;
+            if(millis() - lastSlowLog >= 10000) {
+                lastSlowLog = millis();
+                AUDIO_INFO("slow stream, dropouts are possible");
+            }
+        }
         m_sdet.cnt_slow = 0;
     }
     if(InBuff.bufferFilled() < InBuff.getMaxBlockSize()) m_sdet.cnt_slow++;
@@ -6838,11 +6883,13 @@ boolean Audio::streamDetection(uint32_t bytesAvail) {
     }
     if(InBuff.bufferFilled() > InBuff.getMaxBlockSize() * 2) return false; // enough data available to play
 
-    // if no audio data is received within three seconds, a new connection attempt is started.
+    // Если данные не поступают дольше заданного времени — пробуем переподключиться.
+    // Увеличено с 5 до 10 сек: при конкуренции за WiFi (COVER/iTunes HTTPS) поток может
+    // временно не получать данные; больший таймаут снижает ложные "Stream lost" и циклы реконнекта.
     if(m_sdet.tmr_lost < millis()) {
         m_sdet.cnt_lost++;
         m_sdet.tmr_lost = millis() + 1000;
-        if(m_sdet.cnt_lost == 5) { // 5s no data?
+        if(m_sdet.cnt_lost == 10) { // 10 с без данных — считаем поток потерянным
             m_sdet.cnt_lost = 0;
             AUDIO_INFO("Stream lost -> try new connection");
             m_f_reset_m3u8Codec = false;

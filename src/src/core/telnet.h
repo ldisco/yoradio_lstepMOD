@@ -36,6 +36,10 @@ class Telnet {
     void on_input(const char* str, uint8_t clientId);
   private:
     char cmBuf[220];
+    // Флаг фактического состояния TCP-сервера telnet.
+    // Нужен, чтобы не вызывать hasClient()/accept() до server.begin()
+    // и не ловить краши при переходах SD <-> WiFi режимов.
+    bool m_serverStarted = false;
     bool _isIPSet(IPAddress ip);
     void handleSerial();
     void printHeapFragmentationInfo(uint8_t id);

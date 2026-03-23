@@ -59,14 +59,19 @@ void MyNetwork::WiFiLostConnection(WiFiEvent_t event, WiFiEventInfo_t info){
       network.status=SDREADY;
       display.putRequest(NEWIP, 0);
       Serial.println("[WIFI] Lost in SD mode — playing continues");
+      // [FIX] Не вызываем WiFi.reconnect() здесь: вызов из контекста WiFi-события при
+      // активном разрыве соединений (WebSocket и т.д.) приводил к перезагрузке (rst:0xc).
+      // Переподключение выполнит main loop с задержкой ~1.5 с.
+      network.sdReconnectAfterMs = millis() + 1500;
     }else{
       network.lostPlaying = player.isRunning();
       if (network.lostPlaying) { player.lockOutput = true; player.sendCommand({PR_STOP, 0}); }
       display.putRequest(NEWMODE, LOST);
+      WiFi.reconnect();
     }
   }
   network.beginReconnect = true;
-  WiFi.reconnect();
+  if (config.getMode() != PM_SDCARD) WiFi.reconnect();
 }
 
 bool MyNetwork::wifiBegin(bool silent){

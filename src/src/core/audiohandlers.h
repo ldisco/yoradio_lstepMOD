@@ -107,8 +107,18 @@ static void resetSdId3Buffers(){
 }
 
 void audio_info(const char *info) {
+  // Критично: формат потока обновлять ДО раннего return по lockOutput.
+  // Иначе при lockOutput=true строка "format is flac" не доходит до setBitrateFormat,
+  // конфиг остаётся BF_OGG (после "format is ogg"), и TrackFacts не видит FLAC
+  // (не срабатывает блок авто-AI на FLAC → лишний DeepSeek + нагрузка на SSL).
+  if (strstr(info, "format is aac")  != NULL) { g_audioFormatFlacActive = false; config.setBitrateFormat(BF_AAC); display.putRequest(DBITRATE); netserver.requestOnChange(BITRATE, 0); }
+  if (strstr(info, "format is flac") != NULL) { g_audioFormatFlacActive = true; config.setBitrateFormat(BF_FLAC); display.putRequest(DBITRATE); netserver.requestOnChange(BITRATE, 0); }
+  if (strstr(info, "format is mp3")  != NULL) { g_audioFormatFlacActive = false; config.setBitrateFormat(BF_MP3); display.putRequest(DBITRATE); netserver.requestOnChange(BITRATE, 0); }
+  if (strstr(info, "format is wav")  != NULL) { g_audioFormatFlacActive = false; config.setBitrateFormat(BF_WAV); display.putRequest(DBITRATE); netserver.requestOnChange(BITRATE, 0); }
+  if (strstr(info, "format is ogg")  != NULL) { g_audioFormatFlacActive = false; config.setBitrateFormat(BF_OGG); display.putRequest(DBITRATE); netserver.requestOnChange(BITRATE, 0); }
+
   if(player.lockOutput) return;
-  // [FIX] Сообщения восстановления декодера не выводим в лог (Serial блокирует → фризы).
+  // [FIX] Сообщения восстановления декодера не выводим в лог (Serial блокирует → фризы), но обработку (формат, BitRate для UI) оставляем.
   const bool isDecoderSpam = (strstr(info, "invalid frameheader") != NULL) ||
                              (strstr(info, "syncword found") != NULL) ||
                              (strstr(info, "BitRate:") != NULL) ||
@@ -121,11 +131,7 @@ void audio_info(const char *info) {
   #ifdef USE_NEXTION
     nextion.audioinfo(info);
   #endif
-  if (strstr(info, "format is aac")  != NULL) { config.setBitrateFormat(BF_AAC); display.putRequest(DBITRATE); netserver.requestOnChange(BITRATE, 0); }
-  if (strstr(info, "format is flac") != NULL) { config.setBitrateFormat(BF_FLAC); display.putRequest(DBITRATE); netserver.requestOnChange(BITRATE, 0); }
-  if (strstr(info, "format is mp3")  != NULL) { config.setBitrateFormat(BF_MP3); display.putRequest(DBITRATE); netserver.requestOnChange(BITRATE, 0); }
-  if (strstr(info, "format is wav")  != NULL) { config.setBitrateFormat(BF_WAV); display.putRequest(DBITRATE); netserver.requestOnChange(BITRATE, 0); }
-  if (strstr(info, "format is ogg")  != NULL) { config.setBitrateFormat(BF_OGG); display.putRequest(DBITRATE); netserver.requestOnChange(BITRATE, 0); }
+  // format is * — см. блок в начале функции (до lockOutput)
   // [FIX] "skip metadata" — в SD режиме НЕ перезаписываем title значением name!
   //        Это приводило к перепутыванию station.name и station.title.
   //        В SD режиме метаданные управляются через ID3 теги (flushSdId3Meta).
@@ -133,7 +139,7 @@ void audio_info(const char *info) {
   // Дополнительно: НЕ перезаписываем системные статусы вида "[остановлено]" и "[готов]"
   // при уже остановленном плеере. Debounce/колбэки audio_info могут прийти ПОСЛЕ Stop(),
   // и без этой проверки WebUI снова увидит старый тег вместо статуса остановки.
-  // Как в ранних версиях: "skip metadata" → показываем имя станции.
+  // Как в референсе: "skip metadata" → показываем имя станции.
   // В SD режиме не трогаем — там метаданные управляются через ID3.
   if (strstr(info, "skip metadata") != NULL && config.getMode() != PM_SDCARD) {
     config.setTitle(config.station.name);
@@ -188,7 +194,7 @@ void audio_showstation(const char *info) {
 void audio_showstreamtitle(const char *info) {
   // В SD режиме метаданные приходят через ID3 теги, StreamTitle не используем.
   if (config.getMode() == PM_SDCARD) return;
-  // Как в ранних версиях: просто принимаем StreamTitle и кладём в setTitle.
+  // Как в референсе: просто принимаем StreamTitle и кладём в setTitle.
   // setTitle сам решит, можно ли перезаписать текущий заголовок.
   if (strstr(info, "Account already in use") != NULL || strstr(info, "HTTP/1.0 401") != NULL || strstr(info, "HTTP/1.1 401") != NULL) player.setError(info);
   bool p = printable(info) && (strlen(info) > 0);
@@ -200,8 +206,12 @@ void audio_showstreamtitle(const char *info) {
 }
 
 void audio_error(const char *info) {
-  // Как в ранних версиях: просто передаём ошибку в player.
+  // Как в референсе: передаём ошибку в player (заголовок/дисплей).
   player.setError(info);
+  // Всплывающее уведомление внизу веб-интерфейса (тот же toast, что у таймера сна).
+  if (info && strcmp(info, "timeout") == 0) {
+    netserver.sendToast("Станция не отвечает", true);
+  }
 }
 
 // Fallback для icy-description: используем описание станции как тег,

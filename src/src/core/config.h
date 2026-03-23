@@ -44,6 +44,8 @@
 
 /** Время последней активности веб-потока (мс), обновляется из audio_stream_activity. Используется watchdog'ом. */
 extern volatile uint32_t g_lastWebStreamActivityMs;
+/** true после audio_info «format is flac» до prepareForPlaying — доп. признак FLAC для TrackFacts, если BF_* ещё не совпал. */
+extern volatile bool g_audioFormatFlacActive;
 
 enum playMode_e      : uint8_t  { PM_WEB=0, PM_SDCARD=1 };
 
@@ -233,9 +235,10 @@ class Config {
     void escapeQuotes(const char* input, char* output, size_t maxLen);
     bool parseCSV(const char* line, char* name, char* url, int &ovol);
     bool parseJSON(const char* line, char* name, char* url, int &ovol);
-    bool parseWsCommand(const char* line, char* cmd, char* val, uint8_t cSize);
+    bool parseWsCommand(const char* line, char* cmd, size_t cmdSize, char* val, size_t valSize);
     bool parseSsid(const char* line, char* ssid, char* pass);
-    bool loadStation(uint16_t station);
+    /** Загрузить станцию по номеру. useSDPlaylist=true — всегда брать плейлист SD (для перехода WEB→SD без гонки getMode() на другом ядре). */
+    bool loadStation(uint16_t station, bool useSDPlaylist = false);
     bool initNetwork();
     bool saveWifi();
     void setTimeConf();
@@ -308,7 +311,8 @@ class Config {
     bool LittleFSCleanup();
     void waitConnection();
     char * ipToStr(IPAddress ip);
-    bool prepareForPlaying(uint16_t stationId);
+    /** forceSDPlaylist=true — загружать из SD-плейлиста независимо от getMode() (при переходе WEB→SD). */
+    bool prepareForPlaying(uint16_t stationId, bool forceSDPlaylist = false);
     void configPostPlaying(uint16_t stationId);
     /** WEB: если станция не прислала тег в течение таймаута, заменяет "[соединение]" на имя станции. */
     void updateConnectTitleFallback();
@@ -351,7 +355,11 @@ class Config {
       }
       if(commit)
         EEPROM.commit();
-      Serial.printf("[saveValue] Saving value: '%s' (len=%zu, EEPROM bytes=%zu)\n", value, valueLen, N);
+      if (field == store.geminiApiKey || field == store.weatherkey) {
+        Serial.printf("[saveValue] Saving value: (secret) len=%zu, EEPROM bytes=%zu\n", valueLen, N);
+      } else {
+        Serial.printf("[saveValue] Saving value: '%s' (len=%zu, EEPROM bytes=%zu)\n", value, valueLen, N);
+      }
     }
     uint32_t getChipId(){
       uint32_t chipId = 0;
@@ -446,13 +454,26 @@ extern SPIClass  SPI2;
 // Блокирует сетевые операции (обложки, факты) на 30 сек после переключения WEB<->SD
 extern volatile bool g_modeSwitching;
 extern volatile unsigned long g_modeSwitchTime;
+// [FIX] Короткий cooldown после переключения станции (внутри WEB режима).
+// Нужен для мягкой стабилизации потока до запуска тяжёлых SSL-задач плагинов.
+extern volatile bool g_stationSwitching;
+extern volatile unsigned long g_stationSwitchTime;
+// Сердцебиение главного цикла (обновляется в loop()). Задача на core 0: если >35 сек нет обновления — зависание, делаем WiFi reconnect без перезагрузки.
 extern volatile uint32_t g_mainLoopHeartbeatMs;
 bool isModeSwitchCooldown();
+bool isStationSwitchCooldown();
+bool isStationSwitchSslBlock(); // true в окне жёсткого post-switch карантина: не запускать SSL для обложек/фактов
 bool isPlaylistBusy();  // true во время индексации SD или сохранения избранного (не запускать обложки/факты)
 bool isSafeForSSL();   // Проверка heap, WiFi, cooldown перед SSL
 bool isSafeForSSLForFacts();  // Проверка heap/WiFi/cooldown перед SSL для TrackFacts
 
 bool coverCacheExists(const String& key);
 String coverCacheUrlForKey(const String& key);
+// После завершения SSL в TrackFacts — запустить отложенную загрузку обложки (если была отложена).
+void resumeDeferredCoverDownload(void);
+// Runtime-тоггл показа обложек на TFT (доступен только если DISPLAY_COVERS_ENABLE=true в myoptions.h).
+bool isDisplayCoversAllowedByBuild();
+bool isDisplayCoversEnabled();
+void setDisplayCoversEnabled(bool enabled);
 
 #endif

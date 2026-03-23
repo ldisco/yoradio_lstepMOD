@@ -11,17 +11,46 @@ if(params.size>0){
 var websocket;
 var wserrcnt = 0;
 var wstimeout, pongtimeout;
-var loaded = false;
+// [FIX][SD+WEB] Таймер клиентского heartbeat для мобильных браузеров.
+
+var wsPingTimer = null;
+
+var shellReady = false;
+var shellPathname = '';
+var clickUiAttached = false;
+function markShellReady(pathname){
+  shellReady = true;
+  shellPathname = pathname || '';
+}
 var currentItem = 0;
 var sdIndexingActive = false; // [FIX] Флаг индексации SD — блокирует обновление nameset/meta
 var trackFactsEnabled = false; // [FIX] Глобальный флаг — включены ли TrackFacts (обновляется из WS)
 var sleepTimerState = { m: 0, left: 0, active: 0, alloff: 0, supported: 0 };
 var playlistmod = new Date().getTime();
 var lastNamesetText = '';
+// Троттлинг обновлений meta/nameset по отдельности: не чаще раз в 400 мс, чтобы плейлист не дёргался
+var lastMetaUpdate = 0, lastNamesetUpdate = 0;
+var META_NAMESET_THROTTLE_MS = 400;
 // WebSocket send queue to avoid flooding the server
 var wsSendQueue = [];
 var wsSendTimer = null;
 var WS_SEND_INTERVAL = 80; // ms between sends
+
+
+var settingsActReceived = false;
+var settingsActRetryCount = 0;
+var settingsActRetryTimer = null;
+function scheduleSettingsActRetry(){
+  clearTimeout(settingsActRetryTimer);
+  settingsActRetryTimer = setTimeout(function(){
+    if(window.location.pathname!='/settings.html') return;
+    if(settingsActReceived) return;
+    if(settingsActRetryCount >= 3) return;
+    settingsActRetryCount++;
+    sendWS('getactive=1');
+    scheduleSettingsActRetry();
+  }, 900);
+}
 function enqueueWS(msg){
   try{ msg = String(msg); }catch(e){ msg = ''+msg; }
   wsSendQueue.push(msg);
@@ -54,9 +83,42 @@ window.addEventListener('load', onLoad);
 
 function loadCSS(href){ const link = document.createElement("link"); link.rel = "stylesheet"; link.href = href; document.head.appendChild(link); }
 function loadJS(src, callback){ const script = document.createElement("script"); script.src = src; script.type = "text/javascript"; script.async = true; script.onload = callback; document.head.appendChild(script); }
+// Подгрузка фрагментов UI: при занятости ESP (SSL/аудио) fetch может «висеть» — снимаем спиннер по таймауту.
+function fetchShellHtml(url, timeoutMs){
+  timeoutMs = (typeof timeoutMs === 'number' && timeoutMs > 0) ? timeoutMs : 20000;
+  return Promise.race([
+    fetch(url).then(function(r){ return r.text(); }),
+    new Promise(function(_, reject){
+      setTimeout(function(){ reject(new Error('shell fetch timeout')); }, timeoutMs);
+    })
+  ]);
+}
+
+// Возвращает яркий цвет полосы буфера по порогам заполнения.
+// 0-15%   -> ярко-красный,
+// 15-50%  -> ярко-жёлтый,
+// 50-100% -> ярко-зелёный.
+function getHeapColorByPercent(percent){
+
+  var p = Number(percent);
+  if (!Number.isFinite(p)) p = 0;
+
+  // Жёстко ограничиваем диапазон 0..100.
+  if (p < 0) p = 0;
+  if (p > 100) p = 100;
+
+  // Ярко-красный сегмент.
+  if (p <= 15) return '#ff3f2f';
+  // Ярко-жёлтый сегмент.
+  if (p <= 50) return '#f2cb2f';
+  // Ярко-зелёный сегмент.
+  return '#39d964';
+}
 
 function initWebSocket() {
   clearTimeout(wstimeout);
+
+  stopWsHeartbeat();
   console.log('Trying to open a WebSocket connection...');
   websocket = new WebSocket(`ws://${hostname}/ws`);
   websocket.onopen    = onOpen;
@@ -64,9 +126,29 @@ function initWebSocket() {
   websocket.onmessage = onMessage;
 }
 function onLoad(event) { initWebSocket(); }
+function startWsHeartbeat(){
+  // [FIX][SD+WEB] На случай повторного вызова — сначала чистим предыдущий интервал.
+  stopWsHeartbeat();
+  // [FIX][SD+WEB] Каждые 4 секунды отправляем лёгкий ping-команду на сервер.
+  // Это создаёт входящий трафик для AsyncTCP и уменьшает риск _poll rx timeout.
+  wsPingTimer = setInterval(function(){
+    if(websocket && websocket.readyState===WebSocket.OPEN){
+      sendWS('ping=1', true);
+    }
+  }, 4000);
+}
+function stopWsHeartbeat(){
+  // [FIX][SD+WEB] Корректно снимаем интервал heartbeat при закрытии/пересоздании сокета.
+  if(wsPingTimer){
+    clearInterval(wsPingTimer);
+    wsPingTimer = null;
+  }
+}
 function pingUp(){
   if(!['/','/index.html'].includes(window.location.pathname)) return;
   clearTimeout(pongtimeout);
+  // [FIX] Увеличен таймаут с 15 до 25 сек — при нагрузке на ESP32 (аудио-реконнект) сервер
+  // может не успевать слать rssi; периодический keepalive на сервере (8 сек) + запас по времени.
   pongtimeout = setTimeout(() => {
     if(!bigplaylist){
       console.log('Connection closed');
@@ -77,8 +159,16 @@ function pingUp(){
 function onOpen(event) {
   console.log('Connection opened');
   pingUp();
-  continueLoading(playMode); //playMode in variables.js
-  loaded = true;
+  // [FIX][SD+WEB] Запускаем клиентский heartbeat только после успешного открытия сокета.
+  startWsHeartbeat();
+  // Полная подгрузка фрагмента — только если ещё не вставили разметку для этого URL
+  // или первая попытка не успела (shellReady=false). Иначе — только досинхронизация.
+  const pathname = window.location.pathname;
+  if (!shellReady || pathname !== shellPathname) {
+    continueLoading(playMode); // playMode in variables.js
+  } else {
+    syncCurrentViewAfterReconnect();
+  }
   wserrcnt=0;
   // [FIX] Проверка загрузки theme.css: если CSS-переменные отсутствуют (ч/б UI),
   // перезагружаем theme.css динамически.
@@ -93,9 +183,34 @@ function onOpen(event) {
     }
   }, 3000);
 }
+
+function syncCurrentViewAfterReconnect(){
+  const pathname = window.location.pathname;
+  if(['/','/index.html'].includes(pathname)){
+    sendWS('getindex=1');
+    sendWS('gettrackfacts=1');
+    return;
+  }
+  if(pathname=='/settings.html'){
+    sendWS('getsystem=1');
+    sendWS('getscreen=1');
+    sendWS('gettimezone=1');
+    sendWS('getweather=1');
+    sendWS('getcontrols=1');
+    sendWS('gettrackfacts=1');
+    sendWS('getactive=1');
+    return;
+  }
+  if(playMode !== 'player'){
+    sendWS('getactive=1');
+  }
+}
+
 function onClose(event) {
   wserrcnt++;
   clearTimeout(pongtimeout);
+  // [FIX][SD+WEB] При закрытии сокета останавливаем heartbeat до следующего onOpen.
+  stopWsHeartbeat();
   // [FIX] Показываем статус пользователю при потере соединения
   var meta = getId('meta');
   if(meta && wserrcnt > 1) meta.textContent = 'Переподключение... (' + wserrcnt + ')';
@@ -230,6 +345,11 @@ function onMessage(event) {
     /* [v0.4.2] Обработка Toast-уведомлений от TrackFacts и системы */
     if(typeof data.toast !== 'undefined'){
       showToast(data.toast, data.isErr === 1);
+      
+      if (data.isErr === 1 && typeof data.toast === 'string' &&
+          data.toast.indexOf('Запрос факта отклонён') !== -1) {
+        closeFactsDialog();
+      }
       return;
     }
     if(typeof data.sleep !== 'undefined'){
@@ -243,7 +363,15 @@ function onMessage(event) {
     }else{
       if(typeof data.current !== 'undefined') { setCurrentItem(data.current); return; }
       if(typeof data.file !== 'undefined') { setPlaylistMod(); generatePlaylist(data.file+"?"+playlistmod); sendWS('submitplaylistdone=1', true); return; }
-      if(typeof data.act !== 'undefined'){ data.act.forEach(showclass=> { classEach(showclass, function(el) { el.classList.remove("hidden"); }); }); return; }
+        if(typeof data.act !== 'undefined'){
+          // Если мы на settings — act подтверждает, что меню реально разморожено.
+          if(window.location.pathname=='/settings.html'){
+            settingsActReceived = true;
+            clearTimeout(settingsActRetryTimer);
+          }
+          data.act.forEach(showclass=> { classEach(showclass, function(el) { el.classList.remove("hidden"); }); });
+          return;
+        }
       if(typeof data.mdns !== 'undefined'){
         const rhost = (hostname==`${data.mdns}.local`)?data.ipaddr:`${data.mdns}.local`;
         getId("radiolink").innerHTML=`<a href="http://${rhost}/settings.html">http://${rhost}/</a>`;
@@ -354,10 +482,22 @@ function setupElement(id, value){
 
   // [FIX] Обновляем глобальный флаг trackFactsEnabled при получении tfen (до проверки element, т.к. на player page элемента #tfen нет)
   if(id === 'tfen') trackFactsEnabled = !!value;
+  // Runtime-переключатель обложек на TFT показываем только когда фича разрешена в сборке (DISPLAY_COVERS_ENABLE=true).
+  if (id === 'covopt') {
+    const covCb = getId('coven');
+    if (covCb) {
+      if (value) covCb.classList.remove('hidden');
+      else covCb.classList.add('hidden');
+    }
+    return;
+  }
 
   if(element){
     if(id=="heap"){
+      // Ширина — фактический процент буфера.
       element.style.width=`${value}%`;
+      // Цвет — по заданным порогам; сама плавность перехода обеспечивается CSS transition у #heap.
+      element.style.backgroundColor = getHeapColorByPercent(value);
       return;
     }
     if(element.classList.contains("checkbox")){
@@ -367,7 +507,7 @@ function setupElement(id, value){
     if(element.classList.contains("classchange")){
       element.attr("class", "classchange");
       element.classList.add(value);
-      // [FIX] При STOP немедленно очищаем мета-данные и сбрасываем обложку
+
       if(id === 'playerwrap' && value === 'stopped') {
         // Сброс обложки на логотип
         var logoEl = getId('logo');
@@ -391,6 +531,16 @@ function setupElement(id, value){
     }
     if(element.classList.contains("text")){
       if(id=='meta'){
+        var now = Date.now();
+        if(now - lastMetaUpdate < META_NAMESET_THROTTLE_MS) return;
+        lastMetaUpdate = now;
+      }
+      if(id=='nameset'){
+        var now = Date.now();
+        if(now - lastNamesetUpdate < META_NAMESET_THROTTLE_MS) return;
+        lastNamesetUpdate = now;
+      }
+      if(id=='meta'){
         if(sdIndexingActive && !isSystemMetaValue(value)) return;
         if(getId('playerwrap') && getId('playerwrap').classList.contains('stopped')) {
           if(value && value.length > 0 && !value.startsWith('[')) return;
@@ -405,7 +555,7 @@ function setupElement(id, value){
         }
       }
       element.innerText=finalValue;
-      if(id=='meta' || id=='nameset') setCurrentItem(currentItem);
+      // setCurrentItem при meta/nameset не вызываем — подсветка/скролл только по data.current и при загрузке плейлиста
     }
     if(element.type==='text' || element.type==='number' || element.type==='password'){
       element.value=value;
@@ -525,6 +675,7 @@ function setCurrentItem(item){
   playlist.querySelectorAll('li').forEach((item, index)=>{
       // Не перезаписываем class целиком: иначе теряются служебные классы фильтров
       // (например, .search-hidden), и поиск "ломается" после первого запуска/PLAY.
+      item.classList.add("play");
       item.classList.remove("active");
       if(index+1==currentItem){
           item.classList.add("active");
@@ -532,7 +683,8 @@ function setCurrentItem(item){
           lih = item.offsetHeight;
       }
   });
-  playlist.scrollTo({ top: (topPos-playlist.offsetHeight/2+lih/2), left: 0, behavior: 'smooth' });
+  // Мгновенный скролл: 'smooth' при частых обновлениях давал дёргание при движении курсора
+  playlist.scrollTo({ top: (topPos-playlist.offsetHeight/2+lih/2), left: 0, behavior: 'auto' });
 }
 function initPLEditor(){
   ple= getId('pleditorcontent');
@@ -582,12 +734,14 @@ function handlePlaylistData(fileData) {
   for(var i = 0;i < lines.length;i++){
     let line = lines[i].split('\t');
     if(line.length>=3){
-      const active=(i+1==currentItem)?' class="active"':'';
+      // Один атрибут class — иначе два class="..." дают невалидный HTML: браузер оставляет
+      // только первый, и строка «текущей» станции теряет .play → клик не попадает в playItem().
+      const activeClass = (i+1==currentItem) ? ' active' : '';
       const genre = line[3] ? line[3].trim() : '';
       const favorite = line[4] ? line[4].trim() : '0';
       const favClass = favorite === '1' ? 'active' : '';
       
-      li=`<li${active} attr-id="${i+1}" class="play" data-name="${line[0].trim()}" data-url="${line[1].trim()}" data-ovol="${line[2].trim()}" data-genre="${genre}" data-favorite="${favorite}">
+      li=`<li class="play${activeClass}" attr-id="${i+1}" data-name="${line[0].trim()}" data-url="${line[1].trim()}" data-ovol="${line[2].trim()}" data-genre="${genre}" data-favorite="${favorite}">
           <button class="favorite-btn ${favClass}" onclick="toggleFavorite(this, event)"></button>
           <span class="text">${line[0].trim()}</span>
           <span class="count">${i+1}</span>
@@ -607,16 +761,19 @@ function handlePlaylistData(fileData) {
 
 function generatePlaylist(path){
   // [FIX v3] Защита от двойного вызова: если плейлист уже грузится — пропускаем.
-  // Иначе два параллельных fetch('/api/playlist') исчерпывают TCP-сокеты ESP32.
   if(bigplaylist) return;
   path = path.replace(/:\/\/.+?\//, `://${hostname}/`);
-  getId('playlist').innerHTML='<div id="progress"><span id="loader"></span></div>';
+  var plEl = getId('playlist');
+  var savedHtml = plEl.innerHTML;
+  plEl.innerHTML='<div id="progress"><span id="loader"></span></div>';
   bigplaylist = true;
-  fetch(path).then(response => response.text()).then(plcontent => { 
-          handlePlaylistData(plcontent);
-        }).catch(() => {
-          handlePlaylistData(null);
-        });
+  fetch(path).then(response => response.text()).then(plcontent => {
+    handlePlaylistData(plcontent);
+  }).catch(() => {
+    // При ошибке (таймаут, занятый LittleFS при избранном и т.д.) не очищаем список — восстанавливаем.
+    plEl.innerHTML = savedHtml;
+    bigplaylist = false;
+  });
 }
 
 /* GENRE & FAVORITES LOGIC */
@@ -1030,7 +1187,41 @@ function toggleGenreDialog() {
 
 // Tabs Dialog - показ фактов о треке по клику на обложке
 let factsDialogTimer = null;
+let factsDialogPollTimer = null;
 window.factsDialogOpen = false; // [FIX] Флаг — когда диалог открыт, факт не показывается в области трека
+// [FIX] Глобальный кеш фактов для диалога:
+// хранит последний валидный набор фактов по текущему треку, чтобы при открытии диалога
+// сначала показывать уже известные данные, а не сразу инициировать новый сетевой запрос.
+window.trackFactsCache = window.trackFactsCache || { title: '', facts: [], updatedAt: 0 };
+
+function setTrackFactsCache(title, facts) {
+  // Нормализуем входной массив: только непустые строки.
+  const safeFacts = (facts || []).filter(f => f && f.trim().length > 0);
+  // Обновляем единый кеш для всех частей WebUI (строка тега + диалог).
+  window.trackFactsCache = {
+    title: title || '',
+    facts: safeFacts,
+    updatedAt: Date.now()
+  };
+}
+
+function closeFactsDialog() {
+  // Централизованно закрываем диалог фактов и очищаем все его таймеры.
+  // Это исключает дублирование кода и ситуации, когда один из таймеров остаётся активным.
+  const dialog = getId('factsdialog');
+  if (dialog) {
+    dialog.style.display = 'none';
+  }
+  window.factsDialogOpen = false;
+  if (factsDialogTimer) {
+    clearTimeout(factsDialogTimer);
+    factsDialogTimer = null;
+  }
+  if (factsDialogPollTimer) {
+    clearTimeout(factsDialogPollTimer);
+    factsDialogPollTimer = null;
+  }
+}
 
 function toggleFactsDialog() {
   const dialog = getId('factsdialog');
@@ -1046,10 +1237,14 @@ function toggleFactsDialog() {
     clearTimeout(factsDialogTimer);
     factsDialogTimer = null;
   }
+  // Очистить таймер фонового опроса фактов в диалоге.
+  if (factsDialogPollTimer) {
+    clearTimeout(factsDialogPollTimer);
+    factsDialogPollTimer = null;
+  }
   
   if (isVisible) {
-    dialog.style.display = 'none';
-    window.factsDialogOpen = false;
+    closeFactsDialog();
   } else {
     // Закрываем другие диалоги
     window.factsDialogOpen = true;
@@ -1069,11 +1264,71 @@ function toggleFactsDialog() {
     
     // Автозакрытие через 30 секунд
     factsDialogTimer = setTimeout(() => {
-      dialog.style.display = 'none';
-      window.factsDialogOpen = false;
-      factsDialogTimer = null;
+      closeFactsDialog();
     }, 30000);
   }
+}
+
+async function pollFactsDialogUntilReady(maxMs) {
+  // Держим диалог "живым" после ручного запроса:
+  // регулярно перепрашиваем API, чтобы не оставлять вечное "⏳ Запрос факта...".
+  const startedAt = Date.now();
+  const content = getId('factsdialog-content');
+  const header = getId('factsdialog-header');
+  if (!content) return;
+
+  // Локальная функция одного шага опроса.
+  const tick = async () => {
+    // Если диалог уже закрыт — прекращаем опрос.
+    if (!window.factsDialogOpen) {
+      factsDialogPollTimer = null;
+      return;
+    }
+
+    try {
+      const response = await fetch('/api/current-fact?t=' + Date.now());
+      if (!response.ok) {
+        content.innerHTML = '<p class="no-facts">Факты недоступны</p>';
+        factsDialogPollTimer = null;
+        return;
+      }
+      const data = await response.json();
+      const facts = (data.facts || []).filter(f => f && f.trim().length > 0);
+      if (header && data.title) {
+        header.innerHTML = '💡 ' + escapeHtmlFacts(data.title);
+      }
+
+      // Если факт уже получен — показываем и завершаем опрос.
+      if (facts.length > 0) {
+        setTrackFactsCache(data.title || '', facts);
+        content.innerHTML = facts.map(f => '<p>💡 ' + escapeHtmlFacts(f) + '</p>').join('');
+        factsDialogPollTimer = null;
+        return;
+      }
+
+      // Если запрос ещё в процессе и мы не вышли по таймауту — продолжаем polling.
+      const elapsed = Date.now() - startedAt;
+      if (data.pending && elapsed < maxMs) {
+        const leftSec = Math.max(1, Math.ceil((maxMs - elapsed) / 1000));
+        content.innerHTML = '<p class="no-facts">⏳ Запрос факта... (' + leftSec + 'с)</p>';
+        factsDialogPollTimer = setTimeout(tick, 1000);
+        return;
+      }
+
+      // Если pending снят или вышли по времени — показываем причину/финальный статус.
+      if (data.status && data.status.length > 0) {
+        content.innerHTML = '<p class="no-facts">' + escapeHtmlFacts(data.status) + '</p>';
+      } else {
+        content.innerHTML = '<p class="no-facts">Запрос факта не выполнен. Попробуйте позже.</p>';
+      }
+      factsDialogPollTimer = null;
+    } catch (e) {
+      content.innerHTML = '<p class="no-facts">Ошибка загрузки фактов</p>';
+      factsDialogPollTimer = null;
+    }
+  };
+
+  await tick();
 }
 
 async function loadFactsForDialog() {
@@ -1092,6 +1347,9 @@ async function loadFactsForDialog() {
     
     const data = await response.json();
     const facts = (data.facts || []).filter(f => f && f.trim().length > 0);
+    // Читаем локальный кеш, накопленный в цикле TrackFacts.
+    const cached = window.trackFactsCache || { title: '', facts: [] };
+    const cachedFacts = (cached.facts || []).filter(f => f && f.trim().length > 0);
     
     // Обновляем заголовок с названием трека
     if (header && data.title) {
@@ -1099,6 +1357,12 @@ async function loadFactsForDialog() {
     }
     
     if (facts.length === 0) {
+      // [FIX] Cache-first: если API временно отдал пусто, но в локальном кеше есть факты
+      // для того же трека — показываем их сразу и не отправляем ручной сетевой запрос.
+      if (cachedFacts.length > 0 && cached.title && data.title && cached.title === data.title) {
+        content.innerHTML = cachedFacts.map(f => '<p>💡 ' + escapeHtmlFacts(f) + '</p>').join('');
+        return;
+      }
       // [FIX] Если есть служебный статус — показываем его, без подмены факта
       if (data.status && data.status.length > 0) {
         content.innerHTML = '<p class="no-facts">' + escapeHtmlFacts(data.status) + '</p>';
@@ -1107,9 +1371,14 @@ async function loadFactsForDialog() {
       // [FIX] Ручной запрос факта по клику на логотип/обложку
       sendWS('trackfactsrequest=1');
       content.innerHTML = '<p class="no-facts">⏳ Запрос факта...</p>';
+      // После ручного запроса не оставляем "вечное ожидание":
+      // опрашиваем API до готовности факта/ошибки с ограничением по времени.
+      pollFactsDialogUntilReady(15000);
       return;
     }
     
+    // Если факты пришли от API — сразу обновляем глобальный кеш.
+    setTrackFactsCache(data.title || '', facts);
     content.innerHTML = facts.map(f => '<p>💡 ' + escapeHtmlFacts(f) + '</p>').join('');
   } catch (e) {
     content.innerHTML = '<p class="no-facts">Ошибка загрузки фактов</p>';
@@ -1149,6 +1418,7 @@ function renderVersionLink() {
 
   // Сборка HTML:
   // - Перед версией остаётся разделитель " | " (как и было),
+
   // - номер версии заворачиваем в <a> с target="_blank".
   versionEl.innerHTML =
     ' | ' +
@@ -1157,6 +1427,7 @@ function renderVersionLink() {
     ver +
     '</a>';
 }
+
 function continueLoading(mode){
   if(typeof mode === 'undefined') return;
   if(mode=="player"){
@@ -1171,78 +1442,71 @@ function continueLoading(mode){
       document.title = `${yoTitle} - Player`;
       fetch(`player.html?${yoVersion}`).then(response => response.text()).then(player => { 
         getId('content').classList.add('idx');
-        getId('content').innerHTML = player; 
-        fetch('logo.svg').then(response => response.text()).then(svg => { 
-          getId('logo').innerHTML = svg;
-          hideSpinner();
-          audiopreview=getId('audiopreview');
-          
-          // Инициализируем часы (будут добавлены в футер программно)
-          initClock();
-          
-          // Обработчик клика вне диалога для его закрытия
-          setTimeout(() => {
-            document.addEventListener('click', function(e) {
-              const dialog = getId('genredialog');
-              const genreBtn = getId('genrebutton');
-              
-              if (dialog && dialog.style.display === 'block' && 
-                  !dialog.contains(e.target) && 
-                  !genreBtn.contains(e.target)) {
-                dialog.style.display = 'none';
-                genreBtn.classList.remove('active');
-              }
-              
-              // Закрытие factsdialog при клике вне него
-              const factsDialog = getId('factsdialog');
-              const logoEl = getId('logo');
-              const coverEl = getId('cover-art-display');
-              if (factsDialog && factsDialog.style.display === 'block' &&
-                  !factsDialog.contains(e.target) &&
-                  (!logoEl || !logoEl.contains(e.target)) &&
-                  (!coverEl || !coverEl.contains(e.target))) {
-                factsDialog.style.display = 'none';
-                window.factsDialogOpen = false;
-                if (factsDialogTimer) {
-                  clearTimeout(factsDialogTimer);
-                  factsDialogTimer = null;
-                }
-              }
-            });
+        getId('content').innerHTML = player;
+        markShellReady(pathname);
+        if (typeof window.rebindCoverArtObservers === 'function') window.rebindCoverArtObservers();
+        // Показываем UI сразу после разметки; logo.svg может подгружаться с задержкой — раньше из‑за этого висел спиннер.
+        hideSpinner();
+        audiopreview=getId('audiopreview');
+        initClock();
+        setTimeout(() => {
+          document.addEventListener('click', function(e) {
+            const dialog = getId('genredialog');
+            const genreBtn = getId('genrebutton');
             
-            // Обработчик клика на логотип/обложку для открытия диалога фактов
+            if (dialog && dialog.style.display === 'block' && 
+                !dialog.contains(e.target) && 
+                !genreBtn.contains(e.target)) {
+              dialog.style.display = 'none';
+              genreBtn.classList.remove('active');
+            }
+            
+            const factsDialog = getId('factsdialog');
             const logoEl = getId('logo');
             const coverEl = getId('cover-art-display');
-            if (logoEl) {
-              logoEl.addEventListener('click', function(e) {
-                e.stopPropagation();
-                toggleFactsDialog();
-              });
+            if (factsDialog && factsDialog.style.display === 'block' &&
+                !factsDialog.contains(e.target) &&
+                (!logoEl || !logoEl.contains(e.target)) &&
+                (!coverEl || !coverEl.contains(e.target))) {
+              closeFactsDialog();
             }
-            if (coverEl) {
-              coverEl.addEventListener('click', function(e) {
-                e.stopPropagation();
-                toggleFactsDialog();
-              });
-            }
-          }, 100);
-        });
+          });
+          
+          const logoEl = getId('logo');
+          const coverEl = getId('cover-art-display');
+          if (logoEl) {
+            logoEl.addEventListener('click', function(e) {
+              e.stopPropagation();
+              toggleFactsDialog();
+            });
+          }
+          if (coverEl) {
+            coverEl.addEventListener('click', function(e) {
+              e.stopPropagation();
+              toggleFactsDialog();
+            });
+          }
+        }, 100);
+        fetch('logo.svg').then(response => response.text()).then(svg => { 
+          getId('logo').innerHTML = svg;
+        }).catch(function(){});
+     
         renderVersionLink();
         document.querySelectorAll('input[type="range"]').forEach(sl => { fillSlider(sl); });
         sendWS('getindex=1');
         sendWS('gettrackfacts=1'); // [FIX] Запрашиваем состояние TrackFacts для player page
-      });
+      }).catch(function(){ hideSpinner(); });
     }
     if(pathname=='/settings.html'){
       document.title = `${yoTitle} - Settings`;
-      fetch(`options.html?${yoVersion}`).then(response => response.text()).then(options => {
+      fetchShellHtml(`options.html?${yoVersion}`).then(options => {
         getId('content').innerHTML = options; 
+        markShellReady(pathname);
+        hideSpinner();
         fetch('logo.svg').then(response => response.text()).then(svg => { 
           getId('logo').innerHTML = svg;
-          hideSpinner();
-        });
-        
-		renderVersionLink();
+        }).catch(function(){});
+        renderVersionLink();
         document.querySelectorAll('input[type="range"]').forEach(sl => { fillSlider(sl); });
         sendWS('getsystem=1');
         sendWS('getscreen=1');
@@ -1260,51 +1524,66 @@ function continueLoading(mode){
         }, 100);
         getWiFi(`http://${hostname}/data/wifi.csv`+"?"+new Date().getTime());
         sendWS('getactive=1');
+        settingsActReceived = false;
+        settingsActRetryCount = 0;
+        scheduleSettingsActRetry();
         classEach("reset", function(el){ el.innerHTML='<svg viewBox="0 0 16 16" class="fill"><path d="M8 3v5a36.973 36.973 0 0 1-2.324-1.166A44.09 44.09 0 0 1 3.417 5.5a52.149 52.149 0 0 1 2.26-1.32A43.18 43.18 0 0 1 8 3z"/><path d="M7 5v1h4.5C12.894 6 14 7.106 14 8.5S12.894 11 11.5 11H1v1h10.5c1.93 0 3.5-1.57 3.5-3.5S13.43 5 11.5 5h-4z"/></svg>'; });
         // Загружаем информацию о файловой системе в TOOLS
         loadFsInfo();
-      });
+      }).catch(function(){ hideSpinner(); });
     }
     if(pathname=='/update.html'){
       document.title = `${yoTitle} - Update`;
       fetch(`updform.html?${yoVersion}`).then(response => response.text()).then(updform => {
         getId('content').classList.add('upd');
         getId('content').innerHTML = updform; 
+        markShellReady(pathname);
+        hideSpinner();
         fetch('logo.svg').then(response => response.text()).then(svg => { 
           getId('logo').innerHTML = svg;
-          hideSpinner();
-        });
+        }).catch(function(){});
+
         renderVersionLink();
-      });
+      }).catch(function(){ hideSpinner(); });
     }
     if(pathname=='/ir.html'){
       document.title = `${yoTitle} - IR Recorder`;
       fetch(`irrecord.html?${yoVersion}`).then(response => response.text()).then(ircontent => {
         getId('content').innerHTML = ircontent;
+        markShellReady(pathname);
+        hideSpinner();
         loadCSS(`ir.css?${yoVersion}`);
         loadJS(`ir.js?${yoVersion}`, () => {
           fetch('logo.svg').then(response => response.text()).then(svg => { 
             getId('logo').innerHTML = svg;
             initControls();
-            hideSpinner();
-          });
+          }).catch(function(){});
         });
+
         renderVersionLink();
-      });
+      }).catch(function(){ hideSpinner(); });
     }
   }else{ // AP mode
-    fetch(`options.html?${yoVersion}`).then(response => response.text()).then(options => {
+    fetchShellHtml(`options.html?${yoVersion}`).then(options => {
       getId('content').innerHTML = options; 
+      markShellReady(window.location.pathname);
+      hideSpinner();
       fetch('logo.svg').then(response => response.text()).then(svg => { 
         getId('logo').innerHTML = svg;
-        hideSpinner();
-      });
+      }).catch(function(){});
+
       renderVersionLink();
       getWiFi(`http://${hostname}/data/wifi.csv`+"?"+new Date().getTime());
       sendWS('getactive=1');
-    });
+      if(window.location.pathname=='/settings.html'){
+        settingsActReceived = false;
+        settingsActRetryCount = 0;
+        scheduleSettingsActRetry();
+      }
+    }).catch(function(){ hideSpinner(); });
   }
-  if(loaded) return;
+  if(clickUiAttached) return;
+  clickUiAttached = true;
   document.body.addEventListener('click', (event) => {
   let target = event.target.closest('div, span, li');
   if(!target) return;
@@ -1791,6 +2070,8 @@ function initClock() {
         currentFacts = [];
         currentFactIndex = 0;
         lastRawFacts = '';
+        // [FIX] При полном сбросе очищаем и общий кеш диалога, чтобы не показывать устаревшие данные.
+        setTrackFactsCache('', []);
         const meta = getMetaElement();
         if (meta) {
             meta.classList.remove('track-fact');
@@ -1845,6 +2126,8 @@ function initClock() {
                 lastRawFacts = facts.join('###');
                 if (facts.length > 0) {
                     currentFacts = facts;
+                    // [FIX] Синхронизируем глобальный кеш сразу после получения фактов от API.
+                    setTrackFactsCache(data.title || '', facts);
                     currentFactIndex = 0;
                     cycleTimer = setTimeout(displayNext, CONFIG.FETCH_DELAY);
                 }
@@ -1854,6 +2137,8 @@ function initClock() {
                 if (newRawFacts !== lastRawFacts && newRawFacts.length > 0) {
                     lastRawFacts = newRawFacts;
                     currentFacts = facts;
+                    // [FIX] Обновляем глобальный кеш при изменении списка фактов на том же треке.
+                    setTrackFactsCache(data.title || '', facts);
                     if (!cycleTimer && !isShowingFact) displayNext();
                 }
                 if (facts.length === 0 && !data.pending) resetAll();
@@ -1871,136 +2156,7 @@ function initClock() {
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
 })();
 
-// ============================================================================
-// [v0.2.0] CoverCache - модуль для отображения обложек
-// ============================================================================
-(function() {
-    const CHECK_INTERVAL = 60000; 
-    const DEFAULT_LOGO = '/logo.svg';
-    const COVER_HEIGHT = '160px';
-    const COVER_MAX_WIDTH = '250px';
-    let currentCoverUrl = '';
-    let isInitialized = false;
-    let lastProcessedTitle = '';
-    let coverFetchInProgress = false;
-    let coverClickTimer = null;
-    let coverMutationTimer = null;
-    let isModeSwitching = false;
-    async function fetchiTunesCover(songTitle) {
-        if (isModeSwitching) return DEFAULT_LOGO;
-        let query = songTitle.replace(/\[.*?\]|\(.*?\)/g, '').trim();
-        if (query.length < 3) return DEFAULT_LOGO;
-        try {
-            const url = `https://itunes.apple.com/search?term=${encodeURIComponent(query)}&entity=musicTrack&limit=1`;
-            const response = await fetch(url);
-            const data = await response.json();
-            if (data.results && data.results.length > 0) {
-                return data.results[0].artworkUrl100.replace('100x100bb.jpg', '600x600bb.jpg');
-            }
-        } catch (e) { console.error("[iTunes] Error:", e); }
-        return DEFAULT_LOGO;
-    }
-    function isPlayerPlaying() {
-        const playerwrap = document.getElementById('playerwrap');
-        return playerwrap && playerwrap.classList.contains('playing');
-    }
-    function updateLogoDisplay(coverUrl, isPlaying) {
-        if (!coverUrl || coverUrl.length < 5) return;
-        const logoDiv = document.getElementById('logo');
-        const coverDiv = document.getElementById('cover-art-display');
-        if (!logoDiv || !coverDiv) return;
-        const commonStyle = "display:flex; justify-content:center; align-items:center; flex:1; width:100%; min-width:0; margin:0 auto;";
-        const showLogo = () => {
-            coverDiv.style.display = 'none'; coverDiv.innerHTML = '';
-            logoDiv.style.cssText = commonStyle; logoDiv.style.display = 'flex';
-        };
-        if (!isPlaying || !coverUrl || coverUrl.includes('logo.svg')) {
-            showLogo();
-        } else {
-            const img = document.createElement('img');
-            img.style.cssText = `height:${COVER_HEIGHT}; width:auto; max-width:${COVER_MAX_WIDTH}; object-fit:contain; border-radius:4px; display:block;`;
-            img.onload = function() {
-                if (this.width > 0) {
-                    coverDiv.innerHTML = ''; coverDiv.appendChild(this);
-                    coverDiv.style.cssText = commonStyle; coverDiv.style.display = 'flex';
-                    logoDiv.style.display = 'none';
-                } else showLogo();
-            };
-            img.onerror = showLogo;
-            img.src = coverUrl;
-        }
-    }
-    async function fetchCoverFromServer() {
-        try {
-            const response = await fetch('/api/current-cover?t=' + Date.now());
-            if (response.ok) return await response.json();
-        } catch (e) { console.error("[CoverArt] Server error"); }
-        return { url: DEFAULT_LOGO };
-    }
-    async function checkAndUpdateCover() {
-        if (isModeSwitching) return;
-        if (window.location.hash.includes('playlist') || document.getElementById('playlisteditor')) return;
-        const isNowPlaying = isPlayerPlaying();
-        const serverData = await fetchCoverFromServer();
-        if (!serverData) return;
-        let serverUrl = serverData.url || DEFAULT_LOGO;
-        const currentTitle = serverData.title || ""; 
-        if (!isNowPlaying || serverUrl.includes('logo.svg')) {
-            if (currentCoverUrl !== DEFAULT_LOGO) {
-                currentCoverUrl = DEFAULT_LOGO;
-                updateLogoDisplay(DEFAULT_LOGO, false);
-            }
-        } else if (serverUrl === "SEARCH_ITUNES") {
-            if (isModeSwitching || currentTitle.length < 3 || currentTitle.startsWith("[")) return;
-            if (lastProcessedTitle !== currentTitle) {
-                lastProcessedTitle = currentTitle;
-                if (currentCoverUrl !== DEFAULT_LOGO) {
-                    currentCoverUrl = DEFAULT_LOGO;
-                    updateLogoDisplay(DEFAULT_LOGO, true);
-                }
-                if (coverFetchInProgress || isModeSwitching) return;
-                coverFetchInProgress = true;
-                const itunesUrl = await fetchiTunesCover(currentTitle);
-                currentCoverUrl = itunesUrl;
-                updateLogoDisplay(itunesUrl, true);
-                coverFetchInProgress = false;
-            }
-        } else if (serverUrl !== currentCoverUrl) {
-            lastProcessedTitle = ''; coverFetchInProgress = false;
-            currentCoverUrl = serverUrl;
-            updateLogoDisplay(serverUrl, true);
-        }
-    }
-    function initCoverSystem() {
-        if (isInitialized) return;
-        document.addEventListener('modeSwitching', (e) => {
-            isModeSwitching = e.detail;
-            if (isModeSwitching) {
-                currentCoverUrl = DEFAULT_LOGO;
-                updateLogoDisplay(DEFAULT_LOGO, false);
-            }
-        });
-        setInterval(checkAndUpdateCover, CHECK_INTERVAL);
-        document.addEventListener('click', function(e) {
-            if (e.target.closest('.station') || e.target.closest('#playbutton') || e.target.closest('#modestopped')) {
-                clearTimeout(coverClickTimer);
-                coverClickTimer = setTimeout(checkAndUpdateCover, 1200);
-            }
-        });
-        const metaEl = document.getElementById('meta');
-        if (metaEl) {
-            const mo = new MutationObserver(() => {
-                clearTimeout(coverMutationTimer);
-                coverMutationTimer = setTimeout(checkAndUpdateCover, 500);
-            });
-            mo.observe(metaEl, { characterData: true, childList: true, subtree: true });
-        }
-        checkAndUpdateCover();
-        setTimeout(checkAndUpdateCover, 2000);
-        isInitialized = true;
-    }
-    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initCoverSystem); else initCoverSystem();
-})();
+// Обложки: только cover.js (подключается выше), без дубликата — иначе двойной poll и «мёртвый» observer.
 
 // ============================================================================
 // Drag-n-Drop для редактора плейлиста

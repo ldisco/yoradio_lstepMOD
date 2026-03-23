@@ -18,7 +18,16 @@ ul, ol { list-style-type: none; margin: 0; padding: 0;}
 h2 { text-align: center; padding-top: 10px; margin: 0 auto; text-transform: uppercase; font-weight: bold; font-size: 26px; color: var(--accent-color); }
 h2.pagetitle { line-height: 48px; margin: 5px 0 5px 0 }
 .hidden { display: none!important; }
-#heap { height: 3px; width: 0%; position: absolute; left: 0; top: 0; background: var(--heapbar-color); }
+#heap {
+  height: 3px;
+  width: 0%;
+  position: absolute;
+  left: 0;
+  top: 0;
+  background: var(--heapbar-color);
+  /* Плавно анимируем ширину полосы, чтобы рост/падение буфера выглядел мягко. */
+  transition: width .25s linear, background-color .35s ease;
+}
 #progress { position: absolute; z-index: 1000; background: var(--main-bg-color); opacity: 0.8; left: 0; right: 0; bottom: 0; top: 0; display: flex; align-items: center; justify-content: center; }
 #loader { width: 8vmin; height: 8vmin; border: 1vmin solid var(--accent-color); border-bottom-color: transparent; border-radius: 50%; display: inline-block; box-sizing: border-box; animation: spinner 1s linear infinite; }
 /* ---logo--- */
@@ -118,7 +127,8 @@ input[type=range] {
   white-space: nowrap; 
 }
 
-/* Часы с мигающим двоеточием */
+/* Золотистые часы с мигающим двоеточием */
+/* Цвет и шрифт полностью идентичны надписи ёRadio в футере */
 #clockdisplay {
   font-size: 11px;
   font-weight: bold;
@@ -281,7 +291,9 @@ input[type=range] {
 
 /* --- PLAYLIST STYLING & ANIMATION --- */
 #playlist {
-  position: relative; scroll-behavior: smooth; scrollbar-color: var(--accent-dark) var(--main-bg-color); overflow: auto; overflow-y: auto; border: solid 1px var(--accent-color); flex: 1 1 auto; height: 0px; width: 110%;
+  position: relative; scroll-behavior: smooth; scrollbar-color: var(--accent-dark) var(--main-bg-color);
+  overflow-y: scroll; overflow-x: hidden; scrollbar-gutter: stable;
+  border: solid 1px var(--accent-color); flex: 1 1 auto; height: 0px; min-height: 0; width: 110%;
   background-image: url('data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAABOAQMAAAAw4lVwAAAABlBMVEUnJycAAADxyujSAAAADklEQVQI12OgLjhATQgAdZgdQbNqrBUAAAAASUVORK5CYII=');
   border: solid 2px var(--accent-color);
   border-color: rgb(255, 0, 0);

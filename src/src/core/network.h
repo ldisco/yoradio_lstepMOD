@@ -9,6 +9,9 @@ class MyNetwork {
     n_Status_e status;
     struct tm timeinfo;
     bool lostPlaying = false, beginReconnect = false;
+    // [FIX] В SD при потере WiFi не вызываем WiFi.reconnect() из обработчика события
+    // (это приводило к перезагрузке). Вместо этого main loop вызовет reconnect после задержки.
+    uint32_t sdReconnectAfterMs = 0;
   public:
     MyNetwork() {};
     void begin();

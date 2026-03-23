@@ -28,7 +28,8 @@ public:
   bool hasPowerPin() const;
 
   // Явная отправка состояния в WebSocket (используется при getindex/getsystem).
-  void pushState();
+  // clientId==0 — textAll всем; иначе только запросившему клиенту.
+  void pushState(uint8_t clientId = 0);
 
 private:
   uint16_t _selectedMinutes;

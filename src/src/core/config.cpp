@@ -37,14 +37,37 @@
 
 // === Watchdog: метка последней активности веб-потока (обновляется из Audio при приходе данных) ===
 volatile uint32_t g_lastWebStreamActivityMs = 0;
+volatile bool g_audioFormatFlacActive = false;
 void audio_stream_activity(void) {
   g_lastWebStreamActivityMs = millis();
 }
 
 // === Асинхронное переключение режимов (WEB <-> SD) ===
+
 // Переносим changeMode в отдельную FreeRTOS-задачу.
 static volatile bool g_changeModeTaskRunning = false;
 static volatile int  g_changeModeTaskRequestedMode = -1;
+
+// [FIX] Защита от «мгновенного» переключения обратно в WEB после перехода в SD (объявление до scheduleChangeModeTask).
+#define MODE_SWITCH_DEBOUNCE_MS 5000
+static volatile unsigned long g_lastSwitchToSdTime = 0;
+
+// [DEBUG][AGENT] Минимальный логгер в NDJSON для диагностики зависания переключения режимов.
+// Пишем в файл сессии debug-0da86f.log, чтобы получить строгие runtime-доказательства.
+static void agentDebugLogCfg(const char* hypothesisId, const char* location, const char* message, const char* dataJson) {
+  FILE* f = fopen("debug-0da86f.log", "a");
+  if (!f) return;
+  fprintf(
+    f,
+    "{\"sessionId\":\"0da86f\",\"runId\":\"run1\",\"hypothesisId\":\"%s\",\"location\":\"%s\",\"message\":\"%s\",\"data\":%s,\"timestamp\":%lu}\n",
+    hypothesisId ? hypothesisId : "",
+    location ? location : "",
+    message ? message : "",
+    dataJson ? dataJson : "{}",
+    (unsigned long)millis()
+  );
+  fclose(f);
+}
 
 static void changeModeTask(void* param) {
   int mode = (int)(intptr_t)param;
@@ -56,8 +79,33 @@ static void changeModeTask(void* param) {
 }
 
 bool scheduleChangeModeTask(int newmode) {
+  {
+    char data[256];
+    snprintf(
+      data, sizeof(data),
+      "{\"newmode\":%d,\"currentMode\":%d,\"taskRunning\":%d,\"modeSwitching\":%d,\"networkStatus\":%d}",
+      newmode, (int)config.getMode(), g_changeModeTaskRunning ? 1 : 0, g_modeSwitching ? 1 : 0, (int)network.status
+    );
+    // #region agent log
+    agentDebugLogCfg("H1", "config.cpp:scheduleChangeModeTask:entry", "schedule request", data);
+    // #endregion
+  }
+  // [FIX] Защита от мгновенного переключения обратно в WEB после перехода в SD:
+  // двойной клик или вторая вкладка часто шлют newmode=0 через 1–2 сек — игнорируем.
+  if (newmode == PM_WEB && config.getMode() == PM_SDCARD &&
+      g_lastSwitchToSdTime != 0 &&
+      (unsigned long)(millis() - g_lastSwitchToSdTime) < MODE_SWITCH_DEBOUNCE_MS) {
+    // #region agent log
+    agentDebugLogCfg("H1", "config.cpp:scheduleChangeModeTask:debounce", "schedule rejected by debounce", "{\"reason\":\"sd_to_web_debounce\"}");
+    // #endregion
+    Serial.printf("[changeModeTask] IGNORE: switch back to WEB within %d s blocked\n", MODE_SWITCH_DEBOUNCE_MS/1000);
+    return false;
+  }
   // Если задача уже запущена — не создаём вторую, чтобы избежать гонок.
   if (g_changeModeTaskRunning) {
+    // #region agent log
+    agentDebugLogCfg("H1", "config.cpp:scheduleChangeModeTask:already_running", "schedule rejected because task already running", "{}");
+    // #endregion
     Serial.printf("[changeModeTask] SKIP: already running (requested=%d)\n", newmode);
     return false;
   }
@@ -76,30 +124,92 @@ bool scheduleChangeModeTask(int newmode) {
   );
   if (res != pdPASS) {
     Serial.println("[changeModeTask] ERROR: task create failed");
+    // #region agent log
+    agentDebugLogCfg("H1", "config.cpp:scheduleChangeModeTask:create_failed", "mode task create failed", "{}");
+    // #endregion
     g_changeModeTaskRunning = false;
     return false;
   }
+  // #region agent log
+  agentDebugLogCfg("H1", "config.cpp:scheduleChangeModeTask:created", "mode task created", "{}");
+  // #endregion
   return true;
 }
 
 #if DSP_MODEL == DSP_NV3041A
 extern void invalidateCoverCache();  // из displayNV3041A.cpp
+#elif DSP_MODEL == DSP_ILI9488 || DSP_MODEL == DSP_ILI9486
+extern void invalidateCoverCache();  // из displayILI9488.cpp
 #else
 inline void invalidateCoverCache() {} // Заглушка для других моделей
 #endif
 
-/* Обертка для вызова invalidateCoverCache только если выбран NV3041A */
+/* После записи обложки в LittleFS — сброс кэша отрисовки (NV3041A / ILI9488 portrait). */
 inline void updateDisplayCover() {
-#if DSP_MODEL == DSP_NV3041A
+#if DSP_MODEL == DSP_NV3041A || DSP_MODEL == DSP_ILI9488 || DSP_MODEL == DSP_ILI9486
   invalidateCoverCache();
 #endif
 }
 
 Config config;
+// Бит в store._reserved: 1 = выключить показ обложек на дисплее (runtime).
+static const uint16_t kReservedFlagDisplayCoverDisabled = 0x0001u;
+
+// Очередь CoverDL (нужны до setDisplayCoversEnabled — сброс при выключении показа).
+static String g_lastCoverKey = "";
+static uint32_t g_lastCoverScheduleMs = 0;
+static String g_pendingCoverUrl = "";
+static String g_pendingCoverKey = "";
+static volatile bool g_coverScheduleDeferred = false;
+
+String currentCoverUrl = "/logo.svg";
+String streamCoverUrl = "";
+
+bool isDisplayCoversAllowedByBuild() {
+  return DISPLAY_COVERS_ENABLE;
+}
+
+bool isDisplayCoversEnabled() {
+  if (!DISPLAY_COVERS_ENABLE) return false;
+  return (config.store._reserved & kReservedFlagDisplayCoverDisabled) == 0;
+}
+
+// "Display Cover" — это только про показ на TFT.
+// Когда выключатель Display Cover OFF, ESP НЕ должна тратить ресурсы на загрузку/кэширование обложек:
+// в этом режиме Web-UI должен показывать обложки сам (browser iTunes / прямые icy-logo URL).
+static inline bool isCoversEnabledForWebOrDisplay() {
+  return isDisplayCoversEnabled();
+}
+
+void setDisplayCoversEnabled(bool enabled) {
+  uint16_t next = config.store._reserved;
+  if (!enabled) next |= kReservedFlagDisplayCoverDisabled;
+  else next &= (uint16_t)~kReservedFlagDisplayCoverDisabled;
+  if (next == config.store._reserved) return;
+  // Важно: commit=true, иначе состояние "Display Cover" не сохраняется после перезагрузки
+  // (аналогично как работает flipscreen).
+  config.saveValue(&config.store._reserved, next, true);
+  // Сброс очереди CoverDL: при выключении показа не должно быть фоновых загрузок в кэш.
+  // Если Web-обложки включены, не гасим CoverDL — иначе Web перестанет получать актуальную картинку.
+  if (!enabled && !WEBUI_COVERS_ENABLE) {
+    g_pendingCoverUrl = "";
+    g_pendingCoverKey = "";
+    g_coverScheduleDeferred = false;
+    g_lastCoverKey = "";
+    currentCoverUrl = "/logo.svg";
+  }
+  updateDisplayCover();
+  display.putRequest(NEWMODE, CLEAR);
+  display.putRequest(NEWMODE, PLAYER);
+}
 
 void u8fix(char *src){
-  char last = src[strlen(src)-1]; 
-  if ((uint8_t)last >= 0xC2) src[strlen(src)-1]='\0';
+  // [FIX] Защита от переполнения: пустая строка или NULL — strlen-1 даёт доступ вне массива.
+  if (!src) return;
+  size_t len = strlen(src);
+  if (len == 0) return;
+  char last = src[len - 1];
+  if ((uint8_t)last >= 0xC2) src[len - 1] = '\0';
 }
 
 bool Config::_isFSempty() {
@@ -127,8 +237,6 @@ bool Config::_isFSempty() {
 }
 
 // 1. Глобальные данные
-String currentCoverUrl = "/logo.svg";
-String streamCoverUrl = "";
 String metaTitle = "";
 String metaArtist = "";
 String currentFact = "";  // Для фактов про композицию (TrackFacts плагин)
@@ -166,10 +274,8 @@ static const char* kCoverCacheIndex = "/station_covers/cache_index.txt";
 static const size_t kMaxCoverBytes = 600 * 1024;
 static const size_t kCoverCacheBytes = COVER_CACHE_MAX_BYTES;
 
-static String g_lastCoverKey = "";
-static String g_pendingCoverUrl = "";
-static String g_pendingCoverKey = "";
 bool g_coverTaskRunning = false;
+// v0.8.139: CoverDL отложен, пока FactsTask держит HTTPS — иначе параллельный mbedTLS → OOM (шпаргалка §7.2).
 static bool g_sdCoverReady = false;
 // Ключ последней сохранённой обложки из ID3-тега (по имени файла).
 // Используется чтобы handleCoverArt мог найти уже готовую обложку
@@ -183,13 +289,23 @@ static size_t g_pendingSdCoverSize = 0;
 static char g_pendingSdCoverKey[128] = {0};
 static SemaphoreHandle_t g_sdCoverWriteSem = nullptr;
 static TaskHandle_t g_sdCoverWriteTaskHandle = nullptr;
+
 // [FIX] Флаг переключения режимов - блокирует сетевые операции
 volatile bool g_modeSwitching = false;
 
 // [FIX] Timestamp последнего переключения режима для cooldown периода
 volatile unsigned long g_modeSwitchTime = 0;
 
+// [FIX] Флаг переключения станции в WEB режиме.
+// Ставится на короткое время во время PR_PLAY, чтобы отложить тяжёлые SSL-задачи плагинов.
+volatile bool g_stationSwitching = false;
+
+// [FIX] Timestamp последнего переключения станции для короткого cooldown периода.
+volatile unsigned long g_stationSwitchTime = 0;
+
+// Сердцебиение главного цикла (main loop на core 1). Задача на core 0 использует для обнаружения зависания и мягкого WiFi reconnect.
 volatile uint32_t g_mainLoopHeartbeatMs = 0;
+
 // [FIX] Период охлаждения после переключения режима (в миллисекундах)
 // В течение этого времени сетевые операции (обложки, факты) блокируются
 // 30 секунд - даём время WebSocket соединениям восстановиться после переключения
@@ -208,10 +324,35 @@ bool isModeSwitchCooldown() {
   return elapsed < MODE_SWITCH_COOLDOWN_MS;
 }
 
+// [FIX] Проверка короткого cooldown после переключения станции.
+// В отличие от смены режима, окно небольшое: только для разгрузки момента старта нового стрима.
+bool isStationSwitchCooldown() {
+  if (g_stationSwitching) return true;
+  if (g_stationSwitchTime == 0) return false;
+  unsigned long elapsed = millis() - g_stationSwitchTime;
+  return elapsed < STATION_SWITCH_COOLDOWN_MS;
+}
+
+// [FIX] Жёсткий "карантин" SSL после переключения станции.
+// Логика:
+// 1) Пока PR_PLAY ещё выполняется (g_stationSwitching=true), блок активен.
+// 2) После завершения PR_PLAY держим дополнительное окно STATION_SWITCH_SSL_BLOCK_MS.
+// Цель: исключить одновременный старт тяжёлых HTTPS-задач (Cover/TrackFacts)
+// в самый чувствительный момент старта нового потока.
+bool isStationSwitchSslBlock() {
+  // Если переключение ещё в процессе — это всегда запрещённое окно.
+  if (g_stationSwitching) return true;
+  // Если переключений ещё не было — блок не нужен.
+  if (g_stationSwitchTime == 0) return false;
+  // Проверяем, прошло ли жёсткое окно после последнего переключения станции.
+  unsigned long elapsed = millis() - g_stationSwitchTime;
+  return elapsed < STATION_SWITCH_SSL_BLOCK_MS;
+}
+
 // [FIX] Безопасно ли делать SSL для обложек — разрешено и в SD-режиме (пониженный порог heap).
 // Обложки на дисплее — единственная SSL-задача, которая допустима в PM_SDCARD,
 // потому что это одиночный HTTP-запрос к iTunes, не конкурирующий с аудиопотоком.
-#define MIN_HEAP_FOR_SSL_COVERS 80000
+// Порог: MIN_HEAP_FOR_SSL_COVERS в options.h / myoptions.h (как в стабильной 0.8.92 + запас под S3).
 // Флаг «плейлист/индекс занят»: true во время setFavorite и indexSDPlaylistFile.
 // В эти моменты не запускаем загрузку обложек и TrackFacts, чтобы не конкурировать с FS и не грузить SSL.
 volatile bool g_playlistBusy = false;
@@ -228,10 +369,25 @@ static uint32_t g_connectTitleSinceMs = 0;
 bool isSafeForSSLCovers() {
   if (g_modeSwitching) return false;
   if (isModeSwitchCooldown()) return false;
+  if (isStationSwitchSslBlock()) return false;
   if (isPlaylistBusy()) return false; // [FIX] Во время индексации/сохранения избранного не трогаем обложки
   if (WiFi.status() != WL_CONNECTED) return false;
   uint32_t freeHeap = ESP.getFreeHeap();
   if (freeHeap < MIN_HEAP_FOR_SSL_COVERS) return false;
+  uint32_t maxAlloc = ESP.getMaxAllocHeap();
+  if (maxAlloc < MIN_MAX_ALLOC_HEAP_FOR_SSL) {
+    if (SSL_BLOCK_LOG_ENABLE) {
+      static uint32_t lastLogMs = 0;
+      uint32_t now = millis();
+      if (now - lastLogMs >= 5000) {
+        Serial.printf("[SSL] Blocked - max alloc %u < %u (covers), free=%u\n",
+                      static_cast<unsigned>(maxAlloc), static_cast<unsigned>(MIN_MAX_ALLOC_HEAP_FOR_SSL),
+                      static_cast<unsigned>(freeHeap));
+        lastLogMs = now;
+      }
+    }
+    return false;
+  }
   return true;
 }
 
@@ -298,7 +454,7 @@ bool isSafeForSSL() {
 // [FIX] Безопасно ли делать SSL запросы для TrackFacts (мягче по heap).
 bool isSafeForSSLForFacts() {
   // Используем общие правила, но с отдельным порогом памяти.
-  // В SD-режиме SSL фактов отключен, чтобы не нагружать систему.
+  // Для SD-режима жёсткого запрета нет: ручной запрос фактов допускается при безопасных условиях.
   static uint32_t lastLogMs = 0;
   auto logBlocked = [&](const char* msg) {
     if (!SSL_BLOCK_LOG_ENABLE) {
@@ -318,6 +474,10 @@ bool isSafeForSSLForFacts() {
   }
   if (isModeSwitchCooldown()) {
     logBlocked("[SSL] Blocked - mode switch cooldown (facts)");
+    return false;
+  }
+  if (isStationSwitchSslBlock()) {
+    logBlocked("[SSL] Blocked - station switch SSL window (facts)");
     return false;
   }
   // Во время экрана настроек не запускаем новые SSL‑запросы фактов, чтобы не трогать звук.
@@ -340,6 +500,19 @@ bool isSafeForSSLForFacts() {
     }
     return false;
   }
+  uint32_t maxAlloc = ESP.getMaxAllocHeap();
+  if (maxAlloc < MIN_MAX_ALLOC_HEAP_FOR_SSL) {
+    if (SSL_BLOCK_LOG_ENABLE) {
+      uint32_t now = millis();
+      if (now - lastLogMs >= 5000) {
+        Serial.printf("[SSL] Blocked - max alloc %u < %u (facts), free=%u\n",
+                      static_cast<unsigned>(maxAlloc), static_cast<unsigned>(MIN_MAX_ALLOC_HEAP_FOR_SSL),
+                      static_cast<unsigned>(freeHeap));
+        lastLogMs = now;
+      }
+    }
+    return false;
+  }
   return true;
 }
 
@@ -350,7 +523,7 @@ bool isSafeForSSLForFacts() {
 // создаёт задержки > 5 сек → WebSocket таймаутит → Web «умирает» на телефонах.
 // Из PSRAM всё отдаётся мгновенно — нет блокировок SPI.
 //
-// Суммарный объём кэша ~42 КБ
+// Суммарный объём кэша ~42 КБ (из 8 МБ PSRAM)
 void initWebAssetsCache() {
   if (!psramInit()) {
     Serial.println("[WEB-CACHE] PSRAM не обнаружен, кэш WebUI отключён");
@@ -466,6 +639,23 @@ static void ensureCoverDir() {
 
 static bool isHttpUrl(const String& url) {
   return url.startsWith("http://") || url.startsWith("https://");
+}
+
+// В icy-url / icy-logo часто приходит ссылка на сайт станции (Telegram, YouTube и т.д.),
+// а не прямой JPEG/PNG — скачивание как картинки даёт connection refused / мусор и съедает TLS/heap.
+static bool isLikelyDirectCoverImageUrl(const String& url) {
+  if (!isHttpUrl(url)) return false;
+  String low = url;
+  low.toLowerCase();
+  static const char* kDeny[] = {
+      "t.me/",       "telegram.me/", "youtube.com/", "youtu.be/",
+      "facebook.com/", "fb.com/",    "instagram.com/", "twitter.com/", "x.com/",
+      "vk.com/",     "ok.ru/",      "tiktok.com/",    "soundcloud.com/",
+  };
+  for (size_t i = 0; i < sizeof(kDeny) / sizeof(kDeny[0]); ++i) {
+    if (low.indexOf(kDeny[i]) >= 0) return false;
+  }
+  return true;
 }
 
 static uint32_t coverHash(const String& key) {
@@ -673,6 +863,10 @@ static void registerCoverCacheFile(const String& path) {
 
 static bool downloadCoverToFile(const String& url, const char* outPath) {
   if (!isHttpUrl(url)) return false;
+  if (!isLikelyDirectCoverImageUrl(url)) {
+    Serial.printf("[COVER-DL] Skip URL (not a direct cover image): %s\n", url.c_str());
+    return false;
+  }
   if (!littleFsReady) return false;
 
   Serial.printf("[COVER-DL] START url=%s -> %s\n", url.c_str(), outPath);
@@ -835,12 +1029,27 @@ static bool downloadCoverToFile(const String& url, const char* outPath) {
   return true;
 }
 
+// Подстрока "timeout" в любом регистре — типичный текст сетевой/аудио ошибки, не название трека.
+static bool titleContainsTimeout(const char* s) {
+  if (!s) return false;
+  static const char kWord[] = "timeout";
+  for (const char* p = s; *p; p++) {
+    size_t i = 0;
+    for (; kWord[i] && p[i]; i++) {
+      if (std::tolower((unsigned char)p[i]) != (unsigned char)kWord[i]) break;
+    }
+    if (kWord[i] == '\0') return true;
+  }
+  return false;
+}
+
 static String fetchiTunesCoverUrl(const String& title) {
   // [FIX] Проверяем безопасность SSL (разрешено в SD-режиме с пониженным порогом)
   if (!isSafeForSSLCovers()) {
     Serial.println("[COVER] iTunes search skipped - SSL not safe");
     return "";
   }
+  if (titleContainsTimeout(title.c_str())) return "";
   
   String query = title;
   query.replace("[", "");
@@ -850,6 +1059,8 @@ static String fetchiTunesCoverUrl(const String& title) {
   query.trim();
   if (query.length() < 3) return "";
   query.replace(" ", "+");
+  query.replace("&", "%26");
+  query.replace("#", "%23");
 
   String url = String("https://itunes.apple.com/search?term=") + query + "&entity=musicTrack&limit=1";
 
@@ -867,7 +1078,7 @@ static String fetchiTunesCoverUrl(const String& title) {
   client.setInsecure();
   client.setTimeout(5);  // 5 секунд таймаут (client expects seconds, not ms!)
   client.setHandshakeTimeout(5);  // 5 секунд на SSL handshake
-  
+
   HTTPClient http;
   http.setTimeout(5000);   // 5 секунд HTTP таймаут
   http.setConnectTimeout(3000);  // 3 секунды на подключение
@@ -878,14 +1089,7 @@ static String fetchiTunesCoverUrl(const String& title) {
     #endif
     return "";
   }
-  
-  // [FIX] Проверяем перед GET запросом
-  if (!isSafeForSSLCovers()) {
-    http.end();
-    Serial.println("[COVER] iTunes GET aborted - SSL not safe");
-    return "";
-  }
-  
+
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
     #if CORE_DEBUG_LEVEL > 0
@@ -949,9 +1153,72 @@ static String fetchiTunesCoverUrl(const String& title) {
   return artUrl;
 }
 
+extern TrackFacts trackFactsPlugin;
+// Определение ниже (после cleanTrackPrefix); нужно для coverDownloadTask.
+static String cleanTrackPrefix(const String& title);
+static String normalizeTitleForCoverSearch(const String& title);
+static void scheduleCoverDownload(const String& url, const String& key);
+
+// Единственная причина, почему isSafeForSSLCovers()==false — «карантин» станции; heap/WiFi/режим уже OK.
+// Тогда не теряем обложку: ставим g_coverScheduleDeferred, timekeeper дернёт resumeDeferredCoverDownload().
+static bool coverDeferredOnlyBecauseStationBlock() {
+  if (!isStationSwitchSslBlock()) return false;
+  if (g_modeSwitching) return false;
+  if (isModeSwitchCooldown()) return false;
+  if (isPlaylistBusy()) return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
+  if (ESP.getFreeHeap() < MIN_HEAP_FOR_SSL_COVERS) return false;
+  if (ESP.getMaxAllocHeap() < MIN_MAX_ALLOC_HEAP_FOR_SSL) return false;
+  return true;
+}
+
+// Не параллелить CoverDL с mbedTLS в FactsTask: иначе (-32512) SSL OOM при FLAC+DeepSeek+icy-logo.
+static void waitUntilTrackFactsSslIdle(uint32_t maxWaitMs) {
+  const uint32_t t0 = millis();
+  while (trackFactsPlugin.isRequestPending()) {
+    if ((millis() - t0) > maxWaitMs) break;
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
 static void coverDownloadTask(void* param) {
+  // #region agent log
+  Serial.printf("[AGENT][H2] cover task entry pendingUrlLen=%u pendingKeyLen=%u factsPending=%d free=%u max=%u\n",
+                (unsigned)g_pendingCoverUrl.length(),
+                (unsigned)g_pendingCoverKey.length(),
+                trackFactsPlugin.isRequestPending() ? 1 : 0,
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)ESP.getMaxAllocHeap());
+  // #endregion
+  // Если в момент старта уже активен/ожидается SSL фактов, кратко ждём.
+  // Это закрывает окно гонки между scheduleCoverDownload() и реальным стартом задачи.
+  while (trackFactsPlugin.isRequestPending()) {
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+
   // [FIX] Проверяем безопасность SSL (разрешено в SD-режиме)
   if (!isSafeForSSLCovers()) {
+    // #region agent log
+    Serial.printf(
+      "[AGENT][H2] cover skip reason modeSwitch=%d cooldown=%d stationWin=%d playlistBusy=%d wifi=%d free=%u max=%u thrFree=%u thrMax=%u\n",
+      g_modeSwitching ? 1 : 0,
+      isModeSwitchCooldown() ? 1 : 0,
+      isStationSwitchSslBlock() ? 1 : 0,
+      isPlaylistBusy() ? 1 : 0,
+      (int)WiFi.status(),
+      (unsigned)ESP.getFreeHeap(),
+      (unsigned)ESP.getMaxAllocHeap(),
+      (unsigned)MIN_HEAP_FOR_SSL_COVERS,
+      (unsigned)MIN_MAX_ALLOC_HEAP_FOR_SSL
+    );
+    // #endregion
+    if (coverDeferredOnlyBecauseStationBlock() && g_pendingCoverUrl.length() > 0 && g_pendingCoverKey.length() > 0) {
+      g_coverScheduleDeferred = true;
+      Serial.println("[COVER] Deferred — station SSL window; retry when safe (poll)");
+      g_coverTaskRunning = false;
+      vTaskDelete(NULL);
+      return;
+    }
     Serial.println("[COVER] Task skipped - SSL not safe");
     g_coverTaskRunning = false;
     vTaskDelete(NULL);
@@ -968,6 +1235,15 @@ static void coverDownloadTask(void* param) {
   String url = g_pendingCoverUrl;
   String key = g_pendingCoverKey;
   g_coverTaskRunning = true;
+
+  // Если не нужно ни на Web, ни на TFT — не кэшируем и не тратим сеть.
+  if (!isCoversEnabledForWebOrDisplay()) {
+    g_coverTaskRunning = false;
+    g_pendingCoverUrl = "";
+    g_pendingCoverKey = "";
+    vTaskDelete(NULL);
+    return;
+  }
 
   if (!littleFsReady) {
     g_coverTaskRunning = false;
@@ -990,6 +1266,8 @@ static void coverDownloadTask(void* param) {
   // Время задержки настраивается через COVER_DOWNLOAD_DELAY_MS (options.h / myoptions.h),
   // по умолчанию 2000 мс. Рекомендуемый диапазон: 1000–5000 мс.
   vTaskDelay(pdMS_TO_TICKS(COVER_DOWNLOAD_DELAY_MS));
+  // За COVER_DOWNLOAD_DELAY FactsTask мог стартовать DeepSeek — снова ждём конца SSL фактов.
+  waitUntilTrackFactsSslIdle(120000);
   
   // [FIX] Проверяем ещё раз после задержки
   if (!isSafeForSSLCovers()) {
@@ -999,8 +1277,39 @@ static void coverDownloadTask(void* param) {
     return;
   }
 
+  // Не тратим SSL на t.me / youtube и т.п. — сразу уходим в iTunes по текущему тегу.
+  if (url != "SEARCH_ITUNES" && url.length() && !isLikelyDirectCoverImageUrl(url)) {
+    Serial.println("[COVER] Stream cover URL is not a direct image — fallback to iTunes");
+    if (streamCoverUrl == url) streamCoverUrl = "";
+    String song = cleanTrackPrefix(metaTitle);
+    String coverSearchTitle = normalizeTitleForCoverSearch(song);
+    if (coverSearchTitle.length() < 3) coverSearchTitle = song;
+    if (coverSearchTitle.length() > 5 && !coverSearchTitle.startsWith("[")) {
+      String itunesKey = String("ITUNES:") + coverSearchTitle;
+      g_coverTaskRunning = false;
+      scheduleCoverDownload("SEARCH_ITUNES", itunesKey);
+      vTaskDelete(NULL);
+      return;
+    }
+    g_coverTaskRunning = false;
+    vTaskDelete(NULL);
+    return;
+  }
+
   if (url == "SEARCH_ITUNES") {
- 
+    // Почему здесь НЕ используем только metaTitle:
+    // 1) coverDownloadTask запускается асинхронно (с задержкой/в отдельной задаче),
+    //    а metaTitle за это время может уже поменяться на следующий трек.
+    // 2) В результате возникал рассинхрон: задача была создана для трека A,
+    //    но фактический запрос в iTunes уходил для трека B.
+    // 3) Это приводило к "не тем" обложкам и ощущению, что дисплей/Web "застрял".
+    //
+    // Что изменено:
+    // - было:  fetchiTunesCoverUrl(metaTitle)
+    // - стало: fetchiTunesCoverUrl(searchTitle), где searchTitle берется из key
+    //          формата "ITUNES:<название>", если такой ключ передан планировщиком.
+    //
+    // Почему это безопасно для WebUI:
     // - меняется только строка поискового запроса к iTunes в фоновой задаче;
     // - путь к кэшу и currentCoverUrl по-прежнему строятся из того же key;
     // - Web получает URL из currentCoverUrl/кэша и не зависит от того,
@@ -1009,6 +1318,7 @@ static void coverDownloadTask(void* param) {
     if (key.startsWith("ITUNES:")) {
       searchTitle = key.substring(7);
     }
+    searchTitle = normalizeTitleForCoverSearch(searchTitle);
 
     Serial.println("[COVER] Searching iTunes for: " + searchTitle);
 
@@ -1021,6 +1331,16 @@ static void coverDownloadTask(void* param) {
       return;
     }
 
+    // Мусор из ошибки потока (HTTP 404 и т.д.) в meta — не слать в iTunes.
+    if (searchTitle.indexOf("HTTP/") >= 0) {
+      Serial.println("[COVER] iTunes search skipped — not a track title");
+      g_coverTaskRunning = false;
+      vTaskDelete(NULL);
+      return;
+    }
+
+    waitUntilTrackFactsSslIdle(120000);
+
     // Выполняем поиск строго по зафиксированному searchTitle.
     // Это гарантирует, что результат соответствует именно той задаче,
     // для которой был создан key.
@@ -1029,9 +1349,17 @@ static void coverDownloadTask(void* param) {
     // Короткая пауза после iTunes-запроса, чтобы не создавать плотную серию
     // сетевых операций при частой смене треков.
     vTaskDelay(pdMS_TO_TICKS(500));
+    waitUntilTrackFactsSslIdle(120000);
   }
 
   if (url.length()) {
+    waitUntilTrackFactsSslIdle(120000);
+    // #region agent log
+    Serial.printf("[AGENT][H2] cover download begin free=%u max=%u urlLen=%u\n",
+                  (unsigned)ESP.getFreeHeap(),
+                  (unsigned)ESP.getMaxAllocHeap(),
+                  (unsigned)url.length());
+    // #endregion
     #if CORE_DEBUG_LEVEL > 0
     Serial.println("[COVER] Downloading: " + url);
     #endif
@@ -1047,31 +1375,65 @@ static void coverDownloadTask(void* param) {
       Serial.println("[COVER] Downloaded successfully, cache invalidated");
       #endif
     } else {
+      // #region agent log
+      Serial.printf("[AGENT][H2] cover download failed free=%u max=%u\n",
+                    (unsigned)ESP.getFreeHeap(),
+                    (unsigned)ESP.getMaxAllocHeap());
+      // #endregion
       #if CORE_DEBUG_LEVEL > 0
       Serial.println("[COVER] Download failed");
       #endif
     }
   }
 
+  // Если пока работала эта задача, пришла новая обложка с другим key — не теряем её.
+  const bool hasDeferredCover =
+    (g_pendingCoverUrl.length() > 0 && g_pendingCoverKey.length() > 0 && g_pendingCoverKey != key);
+
   g_coverTaskRunning = false;
+
+  if (hasDeferredCover) {
+    g_coverTaskRunning = true;
+    BaseType_t nextRes = xTaskCreatePinnedToCore(coverDownloadTask, "CoverDL", 16384, NULL, 1, NULL, 1);
+    if (nextRes != pdPASS) {
+      g_coverTaskRunning = false;
+      Serial.println("[COVER] Failed to create deferred CoverDL task");
+    }
+  }
+
   vTaskDelete(NULL);
 }
 
 extern bool g_coverTaskRunning;
+extern TrackFacts trackFactsPlugin;
 
 static void scheduleCoverDownload(const String& url, const String& key) {
+  if (!isCoversEnabledForWebOrDisplay()) return;
   if (!littleFsReady) return;
   if (network.status != CONNECTED) return;
   if (isPlaylistBusy()) return; // [FIX] Во время индексации/сохранения избранного не ставим в очередь загрузку обложек
-  if (key.length() && key == g_lastCoverKey) return;
+  if (key.length() && key == g_lastCoverKey) {
+    // Для одного и того же трека допускаем редкий повтор, если кэша всё ещё нет.
+    // Это помогает после временных сетевых сбоев без спама HTTPS.
+    if (coverCacheExists(key)) return;
+    const uint32_t nowMs = millis();
+    if (nowMs - g_lastCoverScheduleMs < 15000u) return;
+  }
   
   // Дополнительная защита от некорректных данных
   if (url.length() == 0 || key.length() == 0) return;
   if (url.length() > 512 || key.length() > 128) return; // Разумные ограничения
   
   g_lastCoverKey = key;
+  g_lastCoverScheduleMs = millis();
   g_pendingCoverUrl = url;
   g_pendingCoverKey = key;
+  // v0.8.139: не параллелить CoverDL с FactsTask (DeepSeek → iTunes и т.д.) — иначе (-32512) SSL OOM.
+  if (trackFactsPlugin.isRequestPending()) {
+    g_coverScheduleDeferred = true;
+    Serial.println("[COVER] schedule deferred — TrackFacts SSL busy");
+    return;
+  }
   if (g_coverTaskRunning) return;
   g_coverTaskRunning = true; // [Gemini3Pro] Отмечаем как запущенную ПЕРЕД созданием, чтобы закрыть окно гонки
   
@@ -1082,6 +1444,35 @@ static void scheduleCoverDownload(const String& url, const String& key) {
   BaseType_t res = xTaskCreatePinnedToCore(coverDownloadTask, "CoverDL", 16384, NULL, 1, NULL, 1);
   if (res != pdPASS) {
       g_coverTaskRunning = false; // [Gemini3Pro] Не удалось создать задачу, снимаем блокировку
+  }
+}
+
+// Вызывается из TrackFacts::fetchTask после снятия isRequestInProgress — поднимает отложенный CoverDL.
+void resumeDeferredCoverDownload(void) {
+  if (!isCoversEnabledForWebOrDisplay()) {
+    g_coverScheduleDeferred = false;
+    return;
+  }
+  if (!g_coverScheduleDeferred) return;
+  if (trackFactsPlugin.isRequestPending()) return;
+  if (!isSafeForSSLCovers()) return;  // ждём конца окна станции / heap (флаг не сбрасываем)
+  if (g_pendingCoverUrl.length() == 0 || g_pendingCoverKey.length() == 0) {
+    g_coverScheduleDeferred = false;
+    return;
+  }
+  if (g_coverTaskRunning) return;
+  if (!littleFsReady) return;
+  if (network.status != CONNECTED) return;
+  if (isPlaylistBusy()) return;
+  g_coverScheduleDeferred = false;
+  g_coverTaskRunning = true;
+  BaseType_t res = xTaskCreatePinnedToCore(coverDownloadTask, "CoverDL", 16384, NULL, 1, NULL, 1);
+  if (res != pdPASS) {
+    Serial.println("[COVER] resumeDeferred: failed to create CoverDL task");
+    g_coverTaskRunning = false;
+    g_coverScheduleDeferred = true;
+  } else {
+    Serial.println("[COVER] deferred cover task started (SSL safe)");
   }
 }
 
@@ -1143,6 +1534,77 @@ String cleanTrackPrefix(const String& title) {
     return cleaned;
 }
 
+// Нормализация строки именно для поиска обложки в iTunes.
+// Убирает тех. хвосты ретрансляторов/сборок, которые часто ломают матчинг.
+static String normalizeTitleForCoverSearch(const String& title) {
+    String normalized = cleanTrackPrefix(title);
+    normalized.trim();
+
+    // Сжимаем повторные пробелы/табы до одного пробела.
+    String compact;
+    compact.reserve(normalized.length());
+    bool prevSpace = false;
+    for (int i = 0; i < normalized.length(); i++) {
+        char c = normalized.charAt(i);
+        bool isSpace = (c == ' ' || c == '\t');
+        if (isSpace) {
+            if (!prevSpace) {
+                compact += ' ';
+                prevSpace = true;
+            }
+        } else {
+            compact += c;
+            prevSpace = false;
+        }
+    }
+    compact.trim();
+    normalized = compact;
+
+    // Доп. фильтр для ретрансляторов вида "... *** www.ipmusic.ch".
+    // Раньше это срабатывало только внутри последней пары "(...)".
+    // Здесь режем хвост с доменом даже без скобок, чтобы iTunes не искал по мусору.
+    String normalizedLower = normalized;
+    normalizedLower.toLowerCase();
+    if (normalizedLower.indexOf("ipmusic.ch") >= 0) {
+      // Отрежем с начала "***" (если есть) или с ближайшего "www." до конца.
+      int ipPos = normalizedLower.indexOf("ipmusic.ch");
+      int starPos = normalizedLower.lastIndexOf("***", ipPos);
+      int wwwPos = normalizedLower.lastIndexOf("www.", ipPos);
+      int cutPos = (starPos >= 0) ? starPos : ((wwwPos >= 0) ? wwwPos : ipPos);
+      normalized = normalized.substring(0, cutPos);
+      normalized.trim();
+    }
+
+    // Срезаем только короткий "технический" хвост в последних скобках.
+    // Например: "(cDjShaman.cut)", "(stream rip)".
+    while (normalized.endsWith(")")) {
+        int openPos = normalized.lastIndexOf('(');
+        if (openPos < 0) break;
+
+        String tail = normalized.substring(openPos);
+        if (tail.length() > 48) break; // вероятнее музыкальный блок, оставляем
+
+        String tailLower = tail;
+        tailLower.toLowerCase();
+        const bool looksTechnical =
+            (tailLower.indexOf(".cut") >= 0) ||
+            (tailLower.indexOf("cdj") >= 0) ||
+            (tailLower.indexOf("djshaman") >= 0) ||
+            (tailLower.indexOf("stream") >= 0) ||
+            (tailLower.indexOf("record") >= 0) ||
+            (tailLower.indexOf("rip") >= 0) ||
+            (tailLower.indexOf("www.") >= 0) ||
+            (tailLower.indexOf("*** www.ipmusic.ch") >= 0) ||
+            (tailLower.indexOf("http") >= 0);
+        if (!looksTechnical) break;
+
+        normalized = normalized.substring(0, openPos);
+        normalized.trim();
+    }
+
+    return normalized;
+}
+
 /**
  * Логика выбора обложки (Cover Art).
  * Вызывается каждый раз, когда меняется название станции или тег песни.
@@ -1159,7 +1621,14 @@ static void handleCoverArt(const char* title) {
     // В SD-режиме используем фактическое имя трека, игнорируя служебные заглушки вроде "[next track]".
     String sdTitle = title ? String(title) : String("");
     sdTitle.trim();
-    if (sdTitle.length() < 3 || sdTitle.startsWith("[")) {
+    if (sdTitle.length() < 3 || sdTitle.startsWith("[") || titleContainsTimeout(sdTitle.c_str())) {
+      currentCoverUrl = "/logo.svg";
+      updateDisplayCover();
+      return;
+    }
+
+    // Если не нужно ни на Web, ни на TFT — без кэша/iTunes/ID3-записи на устройство.
+    if (!isCoversEnabledForWebOrDisplay()) {
       currentCoverUrl = "/logo.svg";
       updateDisplayCover();
       return;
@@ -1187,18 +1656,38 @@ static void handleCoverArt(const char* title) {
     // ПРИОРИТЕТ 3: Нет кэша — показываем логотип, затем ищем через iTunes.
     currentCoverUrl = "/logo.svg";
     updateDisplayCover();
-    scheduleCoverDownload("SEARCH_ITUNES", String("ITUNES:") + sdTitle);
+    String coverSearchTitle = normalizeTitleForCoverSearch(sdTitle);
+    String sdTitleLower = sdTitle;
+    sdTitleLower.toLowerCase();
+    const bool origLooksIpmusic = sdTitleLower.indexOf("ipmusic.ch") >= 0;
+    if (coverSearchTitle.length() < 3) {
+      // Если после нормализации остался только ipmusic-хвост,
+      // не возвращаем "как было", чтобы не слать мусор в iTunes.
+      if (origLooksIpmusic) return;
+      coverSearchTitle = sdTitle;
+    }
+    scheduleCoverDownload("SEARCH_ITUNES", String("ITUNES:") + coverSearchTitle);
     return;
   }
     // Храним состояние предыдущих данных, чтобы не обновлять картинку, если песня/станция не изменились
     static String lastStationName;
     static String lastSongTitle;
 
+    // WEB: без активного потока не тянем обложки (и не копим TLS в очереди).
+    if (player.status() != PLAYING || !player.isRunning()) {
+      currentCoverUrl = "/logo.svg";
+      updateDisplayCover();
+      lastStationName = "";
+      lastSongTitle = "";
+      return;
+    }
+
     // --- 1. ПРОВЕРКА СОСТОЯНИЯ ПЛЕЕРА ---
     // Если радио остановлено или только загружается (системные теги [готов], [остановлено]),
     // мы не ищем обложку, а сразу показываем стандартный логотип.
     bool isPlayingNow = true;
-    if (!title || strlen(title) < 3 || strstr(title, "[остановлено]") || strstr(title, "[готов]")) {
+    if (!title || strlen(title) < 3 || strstr(title, "[остановлено]") || strstr(title, "[готов]") ||
+        strstr(title, "[соедин") != nullptr || strstr(title, "[connect") != nullptr) {
         isPlayingNow = false;
     }
 
@@ -1207,6 +1696,9 @@ static void handleCoverArt(const char* title) {
     // искать по ней обложку в iTunes. Такие строки не являются названием трека
     // и только создают лишние запросы и ошибки DNS/TLS.
     if (title && (strstr(title, "Error connecting to ") || strstr(title, "Request http") )) {
+        isPlayingNow = false;
+    }
+    if (title && titleContainsTimeout(title)) {
         isPlayingNow = false;
     }
 
@@ -1220,6 +1712,16 @@ static void handleCoverArt(const char* title) {
 
     String stationName = String(config.station.name);
     String currentSong = cleanTrackPrefix(String(title));
+    String manualCoverUrl;
+    const bool haveStationCover = findManualCover(stationName, manualCoverUrl);
+
+    // Нет реального StreamTitle — только имя станции (fallback). iTunes по нему бессмысленен и грузит сеть.
+    // В этом случае показываем station-cover (если есть), иначе логотип.
+    if (currentSong.length() > 0 && currentSong == stationName) {
+      currentCoverUrl = haveStationCover ? manualCoverUrl : "/logo.svg";
+      updateDisplayCover();
+      return;
+    }
 
     if (stationName == lastStationName && currentSong == lastSongTitle) {
       return;
@@ -1228,23 +1730,10 @@ static void handleCoverArt(const char* title) {
     lastStationName = stationName;
     lastSongTitle = currentSong;
 
-    String manualCoverUrl;
-    if (findManualCover(stationName, manualCoverUrl)) {
-      currentCoverUrl = manualCoverUrl;
+    // Показ обложек на TFT выключен — не кэшируем и не тянем icy-logo/iTunes; веб отдаёт icy-logo в /api/current-cover.
+    if (!isCoversEnabledForWebOrDisplay()) {
+      currentCoverUrl = haveStationCover ? manualCoverUrl : "/logo.svg";
       updateDisplayCover();
-      return;
-    }
-
-    if (streamCoverUrl.length() > 7 && isHttpUrl(streamCoverUrl)) {
-      String key = String("URL:") + streamCoverUrl;
-      if (coverCacheExists(key)) {
-        currentCoverUrl = coverCacheUrlForKey(key);
-        updateDisplayCover();
-      } else {
-        currentCoverUrl = "/logo.svg";
-        updateDisplayCover();
-        scheduleCoverDownload(streamCoverUrl, key);
-      }
       return;
     }
 
@@ -1259,29 +1748,83 @@ static void handleCoverArt(const char* title) {
     }
 
     if (currentSong.length() > 5 && !currentSong.startsWith("[")) {
-      String key = String("ITUNES:") + currentSong;
+      String coverSearchTitle = normalizeTitleForCoverSearch(currentSong);
+      String currentSongLower = currentSong;
+      currentSongLower.toLowerCase();
+      const bool origLooksIpmusic = currentSongLower.indexOf("ipmusic.ch") >= 0;
+      if (coverSearchTitle.length() < 3) {
+        if (origLooksIpmusic) {
+          currentCoverUrl = haveStationCover ? manualCoverUrl : "/logo.svg";
+          updateDisplayCover();
+          return;
+        }
+        coverSearchTitle = currentSong;
+      }
+      String key = String("ITUNES:") + coverSearchTitle;
       if (coverCacheExists(key)) {
         currentCoverUrl = coverCacheUrlForKey(key);
         updateDisplayCover();
       } else {
-        currentCoverUrl = "SEARCH_ITUNES";
+        // Не мигаем пустым/служебным состоянием: пока ищем трек, держим station-cover (если есть).
+        currentCoverUrl = haveStationCover ? manualCoverUrl : "/logo.svg";
         updateDisplayCover();
         scheduleCoverDownload("SEARCH_ITUNES", key);
       }
       return;
     }
 
-    currentCoverUrl = "/logo.svg";
+    // Если по тегу трека искать нечего/нельзя, используем обложку станции из icy-logo/icy-url.
+    if (streamCoverUrl.length() > 7 && isHttpUrl(streamCoverUrl) && isLikelyDirectCoverImageUrl(streamCoverUrl)) {
+      String key = String("URL:") + streamCoverUrl;
+      if (coverCacheExists(key)) {
+        currentCoverUrl = coverCacheUrlForKey(key);
+        updateDisplayCover();
+      } else {
+        currentCoverUrl = haveStationCover ? manualCoverUrl : "/logo.svg";
+        updateDisplayCover();
+        scheduleCoverDownload(streamCoverUrl, key);
+      }
+      return;
+    }
+
+    currentCoverUrl = haveStationCover ? manualCoverUrl : "/logo.svg";
     updateDisplayCover();
 }
 
 // 2. Обработчики событий аудио-библиотеки
 
-// Если станция присылает прямую ссылку в метаданных (редко, но бывает)
+// Если станция присылает ссылку в icy-url (часто главная страница, не картинка).
+// Не затираем URL из icy-logo, если он уже указывает на изображение.
 void audio_icyurl(const char* info) {
-    if (info && strlen(info) > 7) {
-        streamCoverUrl = String(info);
+    if (!info || strlen(info) < 8) return;
+    String s = String(info);
+    s.trim();
+    if (!isHttpUrl(s)) return;
+    if (!isLikelyDirectCoverImageUrl(s)) return;
+    if (streamCoverUrl.length() > 10) {
+      String low = streamCoverUrl;
+      low.toLowerCase();
+      const bool haveImg = low.endsWith(".jpg") || low.endsWith(".jpeg") || low.endsWith(".png") ||
+                           low.endsWith(".webp") || low.endsWith(".gif") || low.endsWith(".svg");
+      if (haveImg) {
+        String ns = s;
+        ns.toLowerCase();
+        const bool newIsImg = ns.endsWith(".jpg") || ns.endsWith(".jpeg") || ns.endsWith(".png") ||
+                              ns.endsWith(".webp") || ns.endsWith(".gif") || ns.endsWith(".svg");
+        if (!newIsImg) return;
+      }
     }
+    streamCoverUrl = s;
+}
+
+// URL обложки из заголовка icy-logo (часто JPG/PNG) — приоритетнее iTunes.
+void audio_icylogo(const char* info) {
+    if (!info || strlen(info) < 8) return;
+    String u = String(info);
+    u.trim();
+    if (!isHttpUrl(u)) return;
+    if (!isLikelyDirectCoverImageUrl(u)) return;
+    streamCoverUrl = u;
 }
 
 // Когда меняется песня (метаданные) — только для WEB режима.
@@ -1336,6 +1879,11 @@ static void sdCoverWriteTask(void* param) {
 
     if (!buf || sz == 0) continue;
 
+    if (!isCoversEnabledForWebOrDisplay()) {
+      free(buf);
+      continue;
+    }
+
     String keyStr(keyBuf);
     String path = coverCachePathForKey(keyStr);
     bool ok = false;
@@ -1361,8 +1909,10 @@ static void sdCoverWriteTask(void* param) {
     }
   }
 }
+
     void audio_id3image(File& file, const size_t pos, const size_t size) {
       if (config.getMode() != PM_SDCARD) return;
+      if (!isCoversEnabledForWebOrDisplay()) return;
       if (size == 0 || size > kMaxCoverBytes) return;
 
       size_t saved_pos = file.position();
@@ -1409,8 +1959,12 @@ static void sdCoverWriteTask(void* param) {
       if (key.length() <= 8) key = "sd:file:unknown";
 
       // [FIX Задача 6+7] Staging через PSRAM: читаем ВСЮ картинку из SD в PSRAM-буфер,
-      // валидируем целостность, затем атомарно записываем в LittleFS под мьютексом.
-     
+      // валидируем целостность; запись в LittleFS выполняется в фоне (sdCoverWriteTask).
+      // Это решает две проблемы:
+      // 1) Раньше чтение из SD шло чанками по 512 байт с записью в LittleFS без мьютекса —
+      //    конкурентный доступ из display-задачи → битые файлы → "раз-через-раз" обложки.
+      // 2) Если SD-чтение обрывалось (readCount==0), файл оставался неполным, но
+      //    g_sdCoverReady всё равно ставился → TJpgDec падал на битом JPEG.
       uint8_t* stagingBuf = (uint8_t*)ps_malloc(imageSize);
       if (!stagingBuf) {
         Serial.printf("[SD Cover] PSRAM alloc failed (%u bytes)\n", (unsigned)imageSize);
@@ -1422,6 +1976,7 @@ static void sdCoverWriteTask(void* param) {
 #if COVER_SD_YIELD_MS > 0
       vTaskDelay(pdMS_TO_TICKS(COVER_SD_YIELD_MS));
 #endif
+
       file.seek(imagePos);
       size_t totalRead = 0;
       while (totalRead < imageSize) {
@@ -1599,6 +2154,7 @@ void Config::init() {
         xTaskCreatePinnedToCore(sdCoverWriteTask, "SDCvWr", 4096, NULL, 0, &g_sdCoverWriteTaskHandle, 1) != pdPASS)
       g_sdCoverWriteTaskHandle = NULL;
   }
+
   // Инициализируем PSRAM‑кэш для ключевых WebUI-файлов (script.js/style.css).
   // Это важный шаг для снижения нагрузки на LittleFS и ускорения загрузки
   // веб-интерфейса с телефонов в SD‑режиме.
@@ -1677,16 +2233,10 @@ void Config::_setupVersion(){
 
 void Config::changeMode(int newmode){
 #ifdef USE_SD
-  // [FIX] Логируем начало переключения режима для отладки зависаний
   Serial.printf("[changeMode] START: current=%d, requested=%d\n", (int)getMode(), newmode);
-  
-  // [FIX] Устанавливаем флаг переключения режимов - блокирует сетевые операции
   g_modeSwitching = true;
-  
-  // [FIX] Даём время другим задачам увидеть флаг g_modeSwitching
   vTaskDelay(pdMS_TO_TICKS(100));
-  
-  // [FIX] Ждём завершения timekeeper sync task (SNTP/Weather) - макс 3 сек (уменьшено с 5)
+  // Ждём завершения timekeeper sync task (SNTP/Weather) - макс 3 сек (уменьшено с 5)
   // Не ждём слишком долго - лучше прервать, чем зависнуть навсегда
   // [FIX] Отправляем WebSocket keepalive каждые 500мс чтобы клиенты не отключались
   uint32_t waitStart = millis();
@@ -1811,7 +2361,8 @@ void Config::changeMode(int newmode){
   if(!_bootDone) return;
   initPlaylistMode();
   vTaskDelay(pdMS_TO_TICKS(5)); // даём core0 обработать очередь дисплея/веб после тяжёлого init
-  if (pir) player.sendCommand({PR_PLAY, getMode()==PM_WEB?store.lastStation:store.lastSdStation});
+  // При переходе в SD шлём PR_PLAY_SD, чтобы плеер (Core 0) грузил из SD-плейлиста без гонки с getMode().
+  if (pir) player.sendCommand({(getMode()==PM_SDCARD) ? PR_PLAY_SD : PR_PLAY, getMode()==PM_WEB?store.lastStation:store.lastSdStation});
   netserver.resetQueue();
   //netserver.requestOnChange(GETPLAYERMODE, 0);
   netserver.requestOnChange(GETINDEX, 0);
@@ -1821,21 +2372,22 @@ void Config::changeMode(int newmode){
   display.putRequest(NEWMODE, PLAYER);
   display.putRequest(NEWSTATION);
   
-  // [FIX] Принудительно обновляем VU-метр после смены режима
+  // [FIX] Принудительно обновляем VU-метр после смены режима 
   display.putRequest(SHOWVUMETER);
 
+
   
-  
-  // [FIX] Сбрасываем флаг и сохраняем время переключения для cooldown
   g_modeSwitching = false;
   g_modeSwitchTime = millis();
-  
   Serial.printf("[changeMode] DONE: newMode=%d (cooldown %d sec)\n", (int)getMode(), MODE_SWITCH_COOLDOWN_MS/1000);
 #endif
 }
 
 void Config::initSDPlaylist() {
 #ifdef USE_SD
+  // #region agent log
+  agentDebugLogCfg("H4", "config.cpp:initSDPlaylist:start", "init SD playlist start", "{}");
+  // #endregion
   // [РЕМОНТ SD] Проверяем существование и РАЗМЕР файла индекса.
   // НОВОЕ ПОВЕДЕНИЕ: indexsd.dat больше не хранится на карте SD.
   // Мы переносим индекс на LittleFS, чтобы:
@@ -1872,6 +2424,11 @@ void Config::initSDPlaylist() {
       File f = LittleFS.open(INDEX_SD_PATH, "r");
       indexSize = f.size();
       f.close();
+    }
+    // Если после пересборки индекс пустой (плейлист пуст или битый) — нужна полная индексация SD
+    if (indexSize < 4) {
+      needFullScan = true;
+      Serial.println("[INIT-SD] Индекс пуст после пересборки — выполняю полное сканирование SD");
     }
   }
   
@@ -1911,6 +2468,17 @@ void Config::initSDPlaylist() {
   } else {
     Serial.println("[INIT-SD] ОШИБКА: Индексный файл все еще не виден!");
   }
+  {
+    char data[256];
+    snprintf(
+      data, sizeof(data),
+      "{\"sdIndexing\":%d,\"playMode\":%d,\"networkStatus\":%d}",
+      sdIndexing ? 1 : 0, (int)getMode(), (int)network.status
+    );
+    // #region agent log
+    agentDebugLogCfg("H4", "config.cpp:initSDPlaylist:end", "init SD playlist end", data);
+    // #endregion
+  }
 #endif
 }
 
@@ -1934,15 +2502,15 @@ char * Config::ipToStr(IPAddress ip){
   snprintf(ipBuf, 16, "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
   return ipBuf;
 }
-bool Config::prepareForPlaying(uint16_t stationId){
+bool Config::prepareForPlaying(uint16_t stationId, bool forceSDPlaylist){
   setDspOn(1);
   vuThreshold = 0;
   screensaverTicks=SCREENSAVERSTARTUPDELAY;
   screensaverPlayingTicks=SCREENSAVERSTARTUPDELAY;
-  if(getMode()!=PM_SDCARD) {
+  if(getMode()!=PM_SDCARD && !forceSDPlaylist) {
     display.putRequest(PSTOP);
   }
-  if(!loadStation(stationId)) return false;
+  if(!loadStation(stationId, forceSDPlaylist)) return false;
   // [FIX Задача 5] Немедленный сброс обложки на логотип при смене станции/трека.
   // Раньше старая обложка висела, пока не скачается новая — пользователь видел
   // обложку от предыдущей станции даже если новая не работает.
@@ -1952,17 +2520,26 @@ bool Config::prepareForPlaying(uint16_t stationId){
   g_sdFileKey = "";
   g_lastCoverKey = "";
   updateDisplayCover();
+  // Сброс метаданных Web/фактов: иначе в WebUI и плагинах висит старый трек до первого ICY-тега.
+  metaTitle = "";
+  metaArtist = "";
   // В SD-режиме больше не ставим заглушку "[next track]", чтобы метаданные из ID3 сразу перетирали старый текст.
-  setTitle(getMode()==PM_WEB?LANG::const_PlConnect:"");
+  setTitle((getMode()==PM_WEB && !forceSDPlaylist) ? LANG::const_PlConnect : "");
   station.bitrate=0;
   setBitrateFormat(BF_UNKNOWN);
+  g_audioFormatFlacActive = false;
   display.putRequest(DBITRATE);
   display.putRequest(NEWSTATION);
   display.putRequest(NEWMODE, PLAYER);
+  // [FIX][SD+WEB][CRITICAL] Уведомляем WebUI только через очередь NetServer.
+  // Прямой вызов netserver.loop() из prepareForPlaying() опасен, потому что:
+  // 1) prepareForPlaying() запускается из задачи плеера (другое ядро);
+  // 2) основной netserver.loop() уже крутится в main loop;
+  // 3) параллельный вход в AsyncWebSocket/AsyncTCP даёт гонки (pcb is NULL, rx timeout, фриз).
+  // Поэтому здесь только ставим события в очередь, без прямой обработки сокетов.
   netserver.requestOnChange(STATION, 0);
+  // [FIX][SD+WEB] Обновление состояния плеера ("playing/stopped") также отправляем через очередь.
   netserver.requestOnChange(MODE, 0);
-  netserver.loop();
-  netserver.loop();
   // SmartStart больше не переводим во временное состояние 0.
   // Флаг пользователя должен оставаться стабильным между перезагрузками и обрывами сети.
   return true;
@@ -2349,6 +2926,8 @@ void Config::resetSystem(const char *val, uint8_t clientId){
     saveValue(&store.screensaverPlayingEnabled, false);
     saveValue(&store.screensaverPlayingTimeout, (uint16_t)5);
     saveValue(&store.screensaverPlayingBlank, false);
+    // Сброс "screen" всегда возвращает показ обложек на дисплей в режим ON.
+    setDisplayCoversEnabled(true);
     display.putRequest(NEWMODE, CLEAR); display.putRequest(NEWMODE, PLAYER);
     netserver.requestOnChange(GETSCREEN, clientId);
     return;
@@ -2427,7 +3006,8 @@ void Config::setDefaults() {
   strlcpy(store.weatherlat,"55.7512", 10);
   strlcpy(store.weatherlon,"37.6184", 10);
   strlcpy(store.weatherkey,"", WEATHERKEY_LENGTH);
-  store._reserved = 0;
+  // По умолчанию "Display Cover" выключен.
+  store._reserved = kReservedFlagDisplayCoverDisabled;
   store.lastSdStation = 0;
   store.sdsnuffle = false;
   store.volsteps = 1;
@@ -2824,8 +3404,10 @@ static void favUpdateTask(void* param) {
     // Позиции строк в плейлисте остаются теми же, поэтому INDEX_SD пересобирать не нужно.
     // Это убирает тяжёлую операцию indexSDPlaylistFile() из цепочки сохранения избранного,
     // чтобы веб и основной цикл не «умирали» на больших плейлистах (3000+ треков).
+    // [FIX] Шлём PLAYLIST_UPDATED, а не PLAYLISTSAVED: перестройка индекса не нужна (менялась только 5-я колонка),
+    // а indexSDPlaylistFile() в main loop блокировала цикл на десятки секунд → веб зависал, FREEZE-RECOVERY.
     if (ok) {
-      netserver.requestOnChange(PLAYLISTSAVED, 0);
+      netserver.requestOnChange(PLAYLIST_UPDATED, 0);
     }
   }
 }
@@ -2953,9 +3535,32 @@ uint16_t Config::playlistLength(){
   }
   return out;
 }
-bool Config::loadStation(uint16_t ls) {
+bool Config::loadStation(uint16_t ls, bool useSDPlaylist) {
   int sOvol;
-  uint16_t cs = playlistLength();
+  uint16_t cs;
+  const char* playPath;
+  const char* idxPath;
+  if (useSDPlaylist) {
+    // При переходе WEB→SD задача плеера на Core 0 может ещё видеть getMode()==PM_WEB.
+    // Явно используем SD-плейлист/индекс, чтобы не открыть веб-URL по тому же номеру.
+    if (!LittleFS.exists(INDEX_SD_PATH)) {
+      memset(station.url, 0, BUFLEN);
+      memset(station.name, 0, BUFLEN);
+      strncpy(station.name, "ёRadio", BUFLEN);
+      station.ovol = 0;
+      return false;
+    }
+    File idxFile = LittleFS.open(INDEX_SD_PATH, "r");
+    size_t sz = idxFile.size();
+    idxFile.close();
+    cs = (sz >= 4 && sz % 4 == 0) ? (uint16_t)(sz / 4) : 0;
+    playPath = PLAYLIST_SD_PATH;
+    idxPath  = INDEX_SD_PATH;
+  } else {
+    cs = playlistLength();
+    playPath = REAL_PLAYL;
+    idxPath  = REAL_INDEX;
+  }
   if (cs == 0) {
     memset(station.url, 0, BUFLEN);
     memset(station.name, 0, BUFLEN);
@@ -2963,16 +3568,14 @@ bool Config::loadStation(uint16_t ls) {
     station.ovol = 0;
     return false;
   }
-  if (ls > playlistLength()) {
+  if (ls > cs) {
     ls = 1;
   }
-  // [FIX v2] И плейлист, и индекс теперь всегда на LittleFS (SDPLFS() = &LittleFS).
-  // Аудиофайлы читаются напрямую через sdman, здесь только метаданные.
   fs::FS* playlistFS = SDPLFS();
   fs::FS* indexFS    = SDPLFS();
 
-  File playlist = playlistFS->open(REAL_PLAYL, "r");
-  File index    = indexFS->open(REAL_INDEX, "r");
+  File playlist = playlistFS->open(playPath, "r");
+  File index    = indexFS->open(idxPath, "r");
   index.seek((ls - 1) * 4, SeekSet);
   uint32_t pos;
   index.readBytes((char *) &pos, 4);
@@ -2994,6 +3597,7 @@ bool Config::loadStation(uint16_t ls) {
     
     station.ovol = sOvol;
     setLastStation(ls);
+    if (useSDPlaylist) saveValue(&store.lastSdStation, ls);
   }
   playlist.close();
   return true;
@@ -3013,6 +3617,7 @@ char * Config::stationByNum(uint16_t num){
   index.close();
   playlist.seek(pos, SeekSet);
   strncpy(_stationBuf, playlist.readStringUntil('\t').c_str(), sizeof(_stationBuf));
+  _stationBuf[sizeof(_stationBuf) - 1] = '\0';  // [FIX] strncpy не дописывает \0 при длинной строке
   playlist.close();
   return _stationBuf;
 }
@@ -3036,16 +3641,19 @@ bool Config::parseCSV(const char* line, char* name, char* url, int &ovol) {
   char buf[5];
   tmpe = strstr(cursor, "\t");
   if (tmpe == NULL) return false;
-  strlcpy(name, cursor, tmpe - cursor + 1);
+  // [FIX] Ограничиваем длину буфером BUFLEN (caller передаёт nameBuf[BUFLEN]).
+  size_t nameLen = (size_t)(tmpe - cursor + 1);
+  strlcpy(name, cursor, nameLen < BUFLEN ? nameLen : BUFLEN);
   if (strlen(name) == 0) return false;
   cursor = tmpe + 1;
   tmpe = strstr(cursor, "\t");
   if (tmpe == NULL) return false;
-  strlcpy(url, cursor, tmpe - cursor + 1);
+  size_t urlLen = (size_t)(tmpe - cursor + 1);
+  strlcpy(url, cursor, urlLen < BUFLEN ? urlLen : BUFLEN);
   if (strlen(url) == 0) return false;
   cursor = tmpe + 1;
   if (strlen(cursor) == 0) return false;
-  strlcpy(buf, cursor, 4);
+  strlcpy(buf, cursor, sizeof(buf));
   ovol = atoi(buf);
   return true;
 }
@@ -3070,15 +3678,15 @@ bool Config::parseJSON(const char* line, char* name, char* url, int &ovol) {
   return true;
 }
 
-bool Config::parseWsCommand(const char* line, char* cmd, char* val, uint8_t cSize) {
+bool Config::parseWsCommand(const char* line, char* cmd, size_t cmdSize, char* val, size_t valSize) {
   char *tmpe;
+  if (!line || !cmd || !val || cmdSize == 0 || valSize == 0) return false;
   tmpe = strstr(line, "=");
   if (tmpe == NULL) return false;
-  memset(cmd, 0, cSize);
-  strlcpy(cmd, line, tmpe - line + 1);
-  //if (strlen(tmpe + 1) == 0) return false;
-  memset(val, 0, cSize);
-  strlcpy(val, tmpe + 1, strlen(line) - strlen(cmd) + 1);
+  memset(cmd, 0, cmdSize);
+  strlcpy(cmd, line, (size_t)(tmpe - line + 1) < cmdSize ? (size_t)(tmpe - line + 1) : cmdSize);
+  memset(val, 0, valSize);
+  strlcpy(val, tmpe + 1, valSize);
   return true;
 }
 
@@ -3089,9 +3697,10 @@ bool Config::parseSsid(const char* line, char* ssid, char* pass) {
   uint16_t pos = tmpe - line;
   if (pos > 29 || strlen(line) > 71) return false;
   memset(ssid, 0, 30);
-  strlcpy(ssid, line, pos + 1);
+  strlcpy(ssid, line, (size_t)(pos + 1) < 30 ? (size_t)(pos + 1) : 30);
   memset(pass, 0, 40);
-  strlcpy(pass, line + pos + 1, strlen(line) - pos);
+  // [FIX] Ограничиваем длину буфером 40 — иначе при длинном пароле переполнение pass.
+  strlcpy(pass, line + pos + 1, 40);
   return true;
 }
 
