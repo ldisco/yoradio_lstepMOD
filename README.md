@@ -28,6 +28,8 @@
 
 ### 🎨 Интерфейс и Управление
 * **Новый WebUI:** Всплывающие окна, тултипы, анимированный логотип. Добавлен поиск по плейлисту (иконка лупы). Вывод статистики использования PSRAM и FS прямо в веб-интерфейсе.
+<img width="739" height="1165" alt="изображение" src="https://github.com/user-attachments/assets/1d8a7880-816a-4134-a675-aeadee807193" />
+<img width="551" height="822" alt="8" src="https://github.com/user-attachments/assets/240372a7-7203-44d8-808e-174cc9330c49" />
 * **Smart Display:** На экране с тачскрином переключение между режимами `WEB` и `SD` осуществляется простым касанием верхней части экрана (по названию станции). Вывод обложек отключается в `myoptions.h`.
 * **Файловый менеджер:** Полноценное управление файлами LittleFS прямо из WebUI (с возможностью установки пароля).
 
@@ -41,9 +43,6 @@
 ![6](https://github.com/user-attachments/assets/9366009a-a9b2-4d1c-8439-60a55b63f0a9)
 
 ![7](https://github.com/user-attachments/assets/3f4afe24-2d42-457a-9ae2-23a86a2a838f)
-
-<img width="551" height="822" alt="8" src="https://github.com/user-attachments/assets/240372a7-7203-44d8-808e-174cc9330c49" />
-
 
 ### ⚙️ Ядро и Аудио
 * **Переработанный Watchdog и SmartStart:** Логика восстановления потока и автостарта написана с нуля.
