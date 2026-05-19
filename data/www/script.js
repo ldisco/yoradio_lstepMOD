@@ -1,9 +1,11 @@
 var hostname = window.location.hostname;
 var modesd = false;
+// Прошивка с DLNA шлёт playermode === 'modedlna' при PL_SRC_DLNA (остаёмся в «веб»-ветке плеера, не SD).
+var modedlna = false;
 var bigplaylist = false;
 const query = window.location.search;
 const params = new URLSearchParams(query);
-const yoTitle = 'YURadio';
+const yoTitle = 'Buzig';
 let audiopreview=null;
 if(params.size>0){
   if(params.has('host')) hostname=params.get('host');
@@ -11,80 +13,220 @@ if(params.size>0){
 var websocket;
 var wserrcnt = 0;
 var wstimeout, pongtimeout;
+// Watchdog переподключения: страхует сценарии после reboot, когда браузер не всегда корректно сообщает onclose.
+var wsWatchdogTimer = null;
+var wsConnectStartedAt = 0;
 // [FIX][SD+WEB] Таймер клиентского heartbeat для мобильных браузеров.
-
+// Нужен, чтобы сокет не считался "пассивным" и не уходил в rx timeout на стороне ESP.
 var wsPingTimer = null;
-
+var wsResyncTimer = null;
+var wsDisconnectToastTimer = null;
+// Оболочка страницы (player/options/…) подгружается fetch'ами — нельзя считать её
+// загруженной до успешного innerHTML, иначе при быстром WS-reconnect второй onOpen
+// пропускает continueLoading() и UI остаётся пустым/старым до F5.
 var shellReady = false;
 var shellPathname = '';
 var clickUiAttached = false;
 function markShellReady(pathname){
+
   shellReady = true;
   shellPathname = pathname || '';
 }
 var currentItem = 0;
 var sdIndexingActive = false; // [FIX] Флаг индексации SD — блокирует обновление nameset/meta
+// Флаг первого получения playermode: нужен, чтобы выполнить инициализацию один раз,
+// но не повторять тяжёлый путь (перезагрузка плейлиста/обложки) на каждом повторном кадре.
+var playerModeBootstrapped = false;
 var trackFactsEnabled = false; // [FIX] Глобальный флаг — включены ли TrackFacts (обновляется из WS)
 var sleepTimerState = { m: 0, left: 0, active: 0, alloff: 0, supported: 0 };
 var playlistmod = new Date().getTime();
+// Авто-повтор загрузки плейлиста после старта/ребута:
+// если /api/playlist в первые секунды вернул пустой ответ или сеть дала сбой,
+// делаем несколько коротких повторов.
+var playlistRetryTimer = null;
+var playlistRetryCount = 0;
+var PLAYLIST_RETRY_MAX = 8;
+var PLAYLIST_RETRY_DELAY_MS = 900;
+// Ожидание появления #playlist в DOM (раньше пришёл WS playermode, чем вставился player.html) — отдельный таймер,
+// не тратит счётчик PLAYLIST_RETRY_MAX и не конкурирует с «пустым ответом» /api/playlist.
+var playlistDomWaitTimer = null;
+var playlistDomWaitCount = 0;
+var PLAYLIST_DOM_WAIT_MAX = 120;
+var PLAYLIST_DOM_WAIT_MS = 80;
 var lastNamesetText = '';
 // Троттлинг обновлений meta/nameset по отдельности: не чаще раз в 400 мс, чтобы плейлист не дёргался
 var lastMetaUpdate = 0, lastNamesetUpdate = 0;
 var META_NAMESET_THROTTLE_MS = 400;
-// WebSocket send queue to avoid flooding the server
-var wsSendQueue = [];
+// WebSocket: две очереди — «immediate» (кнопки плеера и т.п.) не должны ждать сотни get*/настроек при CONNECTING/reconnect.
+var wsSendQueueHigh = [];
+var wsSendQueueLow = [];
 var wsSendTimer = null;
 var WS_SEND_INTERVAL = 80; // ms between sends
+// Антиспам для уведомлений состояния WebSocket.
+var lastWsStatusToastAt = 0;
+var wsDisconnectToastShown = false;
 
-
+// [FIX][SETTINGS] После /settings.html пункты меню ждут WS {"act":[...]}. Усиливаем: act и с payload в одном пакете,
+// getactive вне очереди (immediate), двойной rAF перед первым запросом, больше ретраев.
 var settingsActReceived = false;
 var settingsActRetryCount = 0;
 var settingsActRetryTimer = null;
+var SETTINGS_ACT_RETRY_MAX = 12;
+var SETTINGS_ACT_RETRY_MS = 550;
+function settingsNavigationNeedsUnlock(){
+  var nav = getId('navigation');
+  if(!nav) return true;
+  return !nav.querySelector('.navitem:not(.hidden)');
+}
+function applySettingsActFromServer(act){
+  if(typeof act === 'undefined' || act === null || !act.forEach) return;
+  act.forEach(function(showclass){
+    classEach(showclass, function(el) { el.classList.remove("hidden"); });
+  });
+  if(window.location.pathname === '/settings.html'){
+    settingsActReceived = true;
+    clearTimeout(settingsActRetryTimer);
+    settingsActRetryTimer = null;
+  }
+}
 function scheduleSettingsActRetry(){
   clearTimeout(settingsActRetryTimer);
   settingsActRetryTimer = setTimeout(function(){
     if(window.location.pathname!='/settings.html') return;
-    if(settingsActReceived) return;
-    if(settingsActRetryCount >= 3) return;
+    if(!settingsNavigationNeedsUnlock()) return;
+    if(settingsActRetryCount >= SETTINGS_ACT_RETRY_MAX) return;
     settingsActRetryCount++;
-    sendWS('getactive=1');
+    sendWS('getactive=1', true);
     scheduleSettingsActRetry();
-  }, 900);
+  }, SETTINGS_ACT_RETRY_MS);
 }
-function enqueueWS(msg){
+function bootstrapSettingsPageWsQueries(){
+  if(window.location.pathname !== '/settings.html') return;
+  settingsActReceived = false;
+  settingsActRetryCount = 0;
+  clearTimeout(settingsActRetryTimer);
+  settingsActRetryTimer = null;
+  function kick(){
+    sendWS('getactive=1', true);
+    // Все get* — immediate: иначе WS_SEND_INTERVAL мс × N в очереди + конкурирующий трафик → первый ответ приходит,
+    // а при ошибке/пропуске в onMessage UI остаётся в дефолтах до ручного F5.
+    sendWS('getsystem=1', true);
+    sendWS('getscreen=1', true);
+    sendWS('gettimezone=1', true);
+    sendWS('getweather=1', true);
+    sendWS('getcontrols=1', true);
+    sendWS('gettrackfacts=1', true);
+    scheduleSettingsActRetry();
+  }
+  if(window.requestAnimationFrame){
+    requestAnimationFrame(function(){ requestAnimationFrame(kick); });
+  }else{
+    setTimeout(kick, 0);
+  }
+  setTimeout(function(){
+    if(window.location.pathname !== '/settings.html') return;
+    if(!settingsNavigationNeedsUnlock()) return;
+    sendWS('getactive=1', true);
+  }, 320);
+  // Повтор полей настроек после стабилизации DOM/сокета (тот же сценарий, что лечит «всё OFF до F5»).
+  setTimeout(function(){
+    if(window.location.pathname !== '/settings.html') return;
+    if(!getId('settingscontent')) return;
+    sendWS('getsystem=1', true);
+    sendWS('getscreen=1', true);
+    sendWS('gettimezone=1', true);
+    sendWS('getweather=1', true);
+    sendWS('getcontrols=1', true);
+    sendWS('gettrackfacts=1', true);
+  }, 420);
+  // Поздний добор состояния для "медленного старта" после reboot/подачи питания:
+  // иногда плагины (SleepTimer) и часть системных флагов готовы не сразу, поэтому
+  // ранние getsystem (0..420 мс) приходят без нужных полей и кнопки остаются hidden до F5.
+  // Даём ещё один короткий запрос после стабилизации сервисов ESP и DOM.
+  setTimeout(function(){
+    // Страхуемся от ухода пользователя на другую страницу.
+    if(window.location.pathname !== '/settings.html') return;
+    // Если контейнер настроек уже не в DOM (переход/перерисовка), запрос пропускаем.
+    if(!getId('settingscontent')) return;
+    // Повторяем getactive, чтобы гарантированно восстановить видимость пунктов меню настройки.
+    sendWS('getactive=1', true);
+    // Повторяем getsystem: здесь приходят webcpu/wci и триггерится sleep.pushState на сервере.
+    sendWS('getsystem=1', true);
+  }, 1800);
+}
+// Первый заход в настройки: если меню осталось скрытым (act не пришёл до отрисовки), повторим при возврате на вкладку.
+document.addEventListener('visibilitychange', function(){
+  if(document.visibilityState !== 'visible') return;
+  if(window.location.pathname !== '/settings.html') return;
+  var nav = getId('navigation');
+  if(!nav) return;
+  if(!settingsNavigationNeedsUnlock()) return;
+  settingsActReceived = false;
+  settingsActRetryCount = 0;
+  sendWS('getactive=1', true);
+  scheduleSettingsActRetry();
+});
+function enqueueWS(msg, highPriority){
   try{ msg = String(msg); }catch(e){ msg = ''+msg; }
-  wsSendQueue.push(msg);
+  // Пока сокет не OPEN, low-сообщения только копятся (раз в WS_SEND_INTERVAL мс никто не shift'ит) —
+  // после паузы Wi‑Fi/фона на телефоне очередь из сотен volume=* разбирается минутами.
+  if(!highPriority && (!websocket || websocket.readyState !== WebSocket.OPEN)) return;
+  if(highPriority) wsSendQueueHigh.push(msg);
+  else wsSendQueueLow.push(msg);
   if(!wsSendTimer) wsSendTimer = setTimeout(processWSSendQueue, WS_SEND_INTERVAL);
 }
 function processWSSendQueue(){
-  if(!wsSendQueue.length){ clearTimeout(wsSendTimer); wsSendTimer = null; return; }
+  var pending = wsSendQueueHigh.length + wsSendQueueLow.length;
+  if(!pending){ clearTimeout(wsSendTimer); wsSendTimer = null; return; }
   if(websocket && websocket.readyState===WebSocket.OPEN){
-    try{ websocket.send(wsSendQueue.shift()); }catch(e){ /* ignore */ }
+    var msg = wsSendQueueHigh.length ? wsSendQueueHigh.shift() : wsSendQueueLow.shift();
+    try{ websocket.send(msg); }catch(e){ /* ignore */ }
   }
   wsSendTimer = setTimeout(processWSSendQueue, WS_SEND_INTERVAL);
 }
-function sendWS(msg, immediate=false){
-  if(immediate && websocket && websocket.readyState===WebSocket.OPEN){
+function sendWS(msg, immediate){
+  var urgent = immediate === true;
+  if(urgent && websocket && websocket.readyState===WebSocket.OPEN){
     try{ websocket.send(String(msg)); }catch(e){}
     return;
   }
-  enqueueWS(msg);
+  enqueueWS(msg, urgent);
 }
 
-// === COVER ART LOADER ===
-(function(){var s=document.createElement('script');s.src='/cover.js?_='+Date.now();document.head.appendChild(s);})();
+// === COVER ART LOADER (один раз за сессию — повторная вставка давала второй setInterval / observer) ===
+(function(){
+  if(window.__coverScriptInjected) return;
+  window.__coverScriptInjected=true;
+  var s=document.createElement('script');s.src='/cover.js?_='+encodeURIComponent(String(typeof yoVersion!=='undefined'?yoVersion:'1'));document.head.appendChild(s);
+})();
 // === END COVER ART ===
 
 // === TRACK FACTS LOADER ===
-(function(){var s=document.createElement('script');s.src='/facts.js?_='+Date.now();document.head.appendChild(s);})();
+(function(){
+  if(window.__factsScriptInjected) return;
+  window.__factsScriptInjected=true;
+  var s=document.createElement('script');s.src='/facts.js?_='+encodeURIComponent(String(typeof yoVersion!=='undefined'?yoVersion:'1'));document.head.appendChild(s);
+})();
 // === END TRACK FACTS ===
 
 window.addEventListener('load', onLoad);
+// BFCache (назад/вперёд в браузере): вкладка восстанавливается без полной перезагрузки, WebSocket «мёртв»,
+// а shellReady остаётся true — onOpen пропускает continueLoading → пустой или устаревший UI до серии F5.
+window.addEventListener('pageshow', function(ev){
+  if(!ev.persisted) return;
+  try{ if(websocket && websocket.readyState === WebSocket.OPEN) websocket.close(); }catch(e2){}
+  shellReady = false;
+  shellPathname = '';
+  playerModeBootstrapped = false;
+  initWebSocket();
+});
 
 function loadCSS(href){ const link = document.createElement("link"); link.rel = "stylesheet"; link.href = href; document.head.appendChild(link); }
 function loadJS(src, callback){ const script = document.createElement("script"); script.src = src; script.type = "text/javascript"; script.async = true; script.onload = callback; document.head.appendChild(script); }
 // Подгрузка фрагментов UI: при занятости ESP (SSL/аудио) fetch может «висеть» — снимаем спиннер по таймауту.
 function fetchShellHtml(url, timeoutMs){
+  // Возвращаем безопасный таймаут по умолчанию (20 сек), чтобы не срывать загрузку
+  // на слабом Wi‑Fi/в момент пиковых задач ESP.
   timeoutMs = (typeof timeoutMs === 'number' && timeoutMs > 0) ? timeoutMs : 20000;
   return Promise.race([
     fetch(url).then(function(r){ return r.text(); }),
@@ -95,11 +237,12 @@ function fetchShellHtml(url, timeoutMs){
 }
 
 // Возвращает яркий цвет полосы буфера по порогам заполнения.
+// Пороговая логика:
 // 0-15%   -> ярко-красный,
 // 15-50%  -> ярко-жёлтый,
 // 50-100% -> ярко-зелёный.
 function getHeapColorByPercent(percent){
-
+  // Защищаемся от NaN/undefined, чтобы UI не получал некорректный цвет.
   var p = Number(percent);
   if (!Number.isFinite(p)) p = 0;
 
@@ -115,17 +258,84 @@ function getHeapColorByPercent(percent){
   return '#39d964';
 }
 
-function initWebSocket() {
-  clearTimeout(wstimeout);
-
-  stopWsHeartbeat();
-  console.log('Trying to open a WebSocket connection...');
-  websocket = new WebSocket(`ws://${hostname}/ws`);
-  websocket.onopen    = onOpen;
-  websocket.onclose   = onClose;
-  websocket.onmessage = onMessage;
+// Цвет полоски загрузки CPU в WebUI:
+// 0–55% зелёный, 56–90% жёлтый, 91–100% красный.
+function getCpuBarColorByPercent(percent){
+  var p = Number(percent);
+  if (!Number.isFinite(p)) p = 0;
+  if (p < 0) p = 0;
+  if (p > 100) p = 100;
+  if (p <= 55) return '#39d964';
+  if (p <= 90) return '#f2cb2f';
+  return '#ff3f2f';
 }
-function onLoad(event) { initWebSocket(); }
+
+function initWebSocket(){
+  clearTimeout(wstimeout);
+  wstimeout = null;
+  // [FIX][SD+WEB] Перед новым подключением останавливаем старый heartbeat,
+  // чтобы не оставить несколько параллельных таймеров после reconnect.
+  stopWsHeartbeat();
+  
+  // [FIX] Улучшенная логика переподключения с проверкой состояния сети
+  if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    console.log('Network is offline, delaying WebSocket connection...');
+    wstimeout = setTimeout(initWebSocket, 2000);
+    return;
+  }
+  
+  console.log('Trying to open a WebSocket connection...');
+  try {
+    wsConnectStartedAt = Date.now();
+    websocket = new WebSocket(`ws://${hostname}/ws`);
+    websocket.onopen    = onOpen;
+    websocket.onclose   = onClose;
+    websocket.onmessage = onMessage;
+    websocket.onerror   = function(error) {
+      console.log('WebSocket error:', error);
+      // При ошибке сразу закрываем соединение для чистого переподключения
+      if (websocket) websocket.close();
+    };
+  } catch (error) {
+    console.log('WebSocket creation failed:', error);
+    // При ошибке создания сокета пробуем переподключиться через 1 секунду
+    wstimeout = setTimeout(initWebSocket, 1000);
+  }
+}
+function startWsWatchdog(){
+  // Запускаем только один интервал на сессию, иначе появятся дублирующие reconnect-попытки.
+  if(wsWatchdogTimer) return;
+  wsWatchdogTimer = setInterval(function(){
+    // Если уже запланирован reconnect через backoff-таймер — не вмешиваемся.
+    if(wstimeout) return;
+    // Отсутствует сокет после reboot/пробуждения вкладки — мягко инициируем новое подключение.
+    if(!websocket){
+      initWebSocket();
+      return;
+    }
+    // Закрытый сокет без onclose-ветки — пробуем открыть заново.
+    if(websocket.readyState === WebSocket.CLOSED){
+      initWebSocket();
+      return;
+    }
+    // Подключение "залипло" слишком долго — закрываем и даём обычной логике пересоздать сокет.
+    if(websocket.readyState === WebSocket.CONNECTING){
+      var connectAgeMs = Date.now() - (wsConnectStartedAt || 0);
+      if(connectAgeMs > 12000){
+        try{ websocket.close(); }catch(e){}
+      }
+    }
+  }, 3000);
+}
+function onLoad(event) {
+  // Стоковое поведение: единственное действие при загрузке страницы — открыть WS.
+  // Никаких параллельных таймеров автоповтора загрузки shell — это создавало гонки
+  // (continueLoading вызывался дважды и UI мерцал/не успевал прорисовываться).
+  initWebSocket();
+  // Watchdog нужен только чтобы поднять WS, если onclose по какой-то причине не пришёл
+  // (пробуждение вкладки, кратковременный пропуск событий браузером).
+  startWsWatchdog();
+}
 function startWsHeartbeat(){
   // [FIX][SD+WEB] На случай повторного вызова — сначала чистим предыдущий интервал.
   stopWsHeartbeat();
@@ -144,6 +354,47 @@ function stopWsHeartbeat(){
     wsPingTimer = null;
   }
 }
+
+// [FIX] Сохранение состояния UI при отключении WebSocket
+function preserveUiStateOnDisconnect() {
+  // Сохраняем текущее состояние кнопки воспроизведения
+  var playButton = getId('play');
+  if (playButton) {
+    playButton.setAttribute('data-last-state', playButton.classList.contains('playing') ? 'playing' : 'paused');
+  }
+  
+  // Сохраняем текущие метаданные и статус станции
+  var metaElement = getId('meta');
+  var stationElement = getId('station');
+  if (metaElement && metaElement.innerText && !isSystemMetaValue(metaElement.innerText)) {
+    metaElement.setAttribute('data-last-value', metaElement.innerText);
+  }
+  if (stationElement && stationElement.innerText) {
+    stationElement.setAttribute('data-last-value', stationElement.innerText);
+  }
+}
+
+// [FIX] Восстановление состояния UI при повторном подключении
+function restoreUiStateOnReconnect() {
+  var playButton = getId('play');
+  if (playButton && playButton.getAttribute('data-last-state')) {
+    var lastState = playButton.getAttribute('data-last-state');
+    playButton.classList.toggle('playing', lastState === 'playing');
+    playButton.classList.toggle('paused', lastState === 'paused');
+  }
+  
+  // Восстанавливаем метаданные только если текущие значения системные или пустые
+  var metaElement = getId('meta');
+  var stationElement = getId('station');
+  if (metaElement && metaElement.getAttribute('data-last-value') && 
+      (isSystemMetaValue(metaElement.innerText) || !metaElement.innerText.trim())) {
+    metaElement.innerText = metaElement.getAttribute('data-last-value');
+  }
+  if (stationElement && stationElement.getAttribute('data-last-value') && 
+      (!stationElement.innerText.trim())) {
+    stationElement.innerText = stationElement.getAttribute('data-last-value');
+  }
+}
 function pingUp(){
   if(!['/','/index.html'].includes(window.location.pathname)) return;
   clearTimeout(pongtimeout);
@@ -156,19 +407,44 @@ function pingUp(){
     }
   }, 25000);
 }
+function notifyWsStatusToast(message, isError, minIntervalMs){
+  var now = Date.now();
+  var minMs = (typeof minIntervalMs === 'number' && minIntervalMs > 0) ? minIntervalMs : 3000;
+  if(now - lastWsStatusToastAt < minMs) return;
+  lastWsStatusToastAt = now;
+  if(typeof window.showToast === 'function'){
+    window.showToast(message, !!isError);
+  }
+}
 function onOpen(event) {
   console.log('Connection opened');
+  if(wsDisconnectToastTimer){
+    clearTimeout(wsDisconnectToastTimer);
+    wsDisconnectToastTimer = null;
+  }
+  // Если в момент открытия #meta пустой, сразу показываем служебный статус.
+  // Это исключает раздражающую "пустоту" до прихода первого TITLE.
+  var metaOnOpen = getId('meta');
+  if(metaOnOpen && !String(metaOnOpen.innerText || '').trim()){
+    metaOnOpen.innerText = '[соединение]';
+  }
+  // Если до этого было отключение, явно сообщаем пользователю о восстановлении.
+  if(wsDisconnectToastShown){
+    notifyWsStatusToast('Связь с устройством восстановлена.', false, 2000);
+    wsDisconnectToastShown = false;
+  }
   pingUp();
   // [FIX][SD+WEB] Запускаем клиентский heartbeat только после успешного открытия сокета.
   startWsHeartbeat();
-  // Полная подгрузка фрагмента — только если ещё не вставили разметку для этого URL
-  // или первая попытка не успела (shellReady=false). Иначе — только досинхронизация.
-  const pathname = window.location.pathname;
-  if (!shellReady || pathname !== shellPathname) {
-    continueLoading(playMode); // playMode in variables.js
-  } else {
-    syncCurrentViewAfterReconnect();
+  if(wsResyncTimer){
+    clearTimeout(wsResyncTimer);
+    wsResyncTimer = null;
   }
+  // Стоковое поведение: на каждый успешный onOpen целиком пересобираем оболочку страницы.
+  continueLoading(playMode); // playMode in variables.js
+  // hideSpinner оставляем как было раньше: сам спиннер прячется в .then()/.catch() самих fetch'ей continueLoading.
+  // Тут — финальный страховой вызов на случай, если ветка continueLoading отработала синхронно и без сети (повторный reconnect).
+  hideSpinner();
   wserrcnt=0;
   // [FIX] Проверка загрузки theme.css: если CSS-переменные отсутствуют (ч/б UI),
   // перезагружаем theme.css динамически.
@@ -187,18 +463,16 @@ function onOpen(event) {
 function syncCurrentViewAfterReconnect(){
   const pathname = window.location.pathname;
   if(['/','/index.html'].includes(pathname)){
-    sendWS('getindex=1');
-    sendWS('gettrackfacts=1');
+    // Критичный bootstrap после reconnect: отправляем вне low-очереди,
+    // чтобы не ждать WS_SEND_INTERVAL мс * N и быстрее восстановить состояние UI.
+    sendWS('getindex=1', true);
+    sendWS('gettrackfacts=1', true);
+    // getsystem: поля вроде webcpu (полоска CPU) приходят только здесь на странице плеера — без запроса #cpubar остаётся hidden.
+    sendWS('getsystem=1', true);
     return;
   }
   if(pathname=='/settings.html'){
-    sendWS('getsystem=1');
-    sendWS('getscreen=1');
-    sendWS('gettimezone=1');
-    sendWS('getweather=1');
-    sendWS('getcontrols=1');
-    sendWS('gettrackfacts=1');
-    sendWS('getactive=1');
+    bootstrapSettingsPageWsQueries();
     return;
   }
   if(playMode !== 'player'){
@@ -209,13 +483,47 @@ function syncCurrentViewAfterReconnect(){
 function onClose(event) {
   wserrcnt++;
   clearTimeout(pongtimeout);
+  if(wsResyncTimer){
+    clearTimeout(wsResyncTimer);
+    wsResyncTimer = null;
+  }
   // [FIX][SD+WEB] При закрытии сокета останавливаем heartbeat до следующего onOpen.
   stopWsHeartbeat();
-  // [FIX] Показываем статус пользователю при потере соединения
-  var meta = getId('meta');
-  if(meta && wserrcnt > 1) meta.textContent = 'Переподключение... (' + wserrcnt + ')';
-  // [FIX v2] Прогрессивный backoff таймаутов переподключения
-  var delay = wserrcnt<=3 ? 3000 : wserrcnt<=7 ? 5000 : wserrcnt<=10 ? 10000 : 60000;
+  // shellReady НЕ сбрасываем здесь намеренно: DOM прежнего player.html остаётся в браузере.
+  // При следующем onOpen стоковая ветка continueLoading() сама перезапишет content корректно.
+  // Сброс shellReady в onClose приводил к гонке: retry-таймер запускал второй параллельный
+  // continueLoading() до завершения первого, что и давало "чёрный экран до F5".
+  // После reboot устройства браузерная вкладка остаётся живой, но состояние mode-bootstrap
+  // уже невалидно для нового аптайма ESP. Без явного сброса первое сообщение playermode
+  // может пройти как "без изменений", и тяжелая ветка с generatePlaylist() не запустится.
+  // Результат: плейлист появляется только после серии ручных F5. Сбрасываем флаг здесь,
+  // чтобы после повторного подключения playermode снова отработал как первый старт.
+  playerModeBootstrapped = false;
+  // Не перетираем #meta при кратковременных reconnect: это воспринимается как "пропал тег".
+  // [v0.8.189] Возвращаемся к СТОКОВОЙ логике переподключения: фиксированный интервал 2 секунды
+  // в первые 10 попыток. Это критично для сценария "первая подача питания":
+  // пока ESP грузится 5-10 сек, экспоненциальный backoff (100ms,2s,4s,8s,15s) попадал
+  // в окно готовности ESP только на 4-5-й попытке, давая 15-30 сек пустой страницы → F5.
+  // Сток (yoradio-main): каждые 2 сек — попадание в готовность за 2-4 сек, без ручного F5.
+  var delay = wserrcnt<10 ? 2000 : 120000;
+  
+  // Не замораживаем старое состояние UI перед reconnect — ждём актуальные данные от WS.
+  // Не пугаем пользователя ложным «потеряна связь» на коротких микропровалах:
+  // показываем уведомление только если обрыв длится заметно долго.
+  if(wsDisconnectToastTimer){
+    clearTimeout(wsDisconnectToastTimer);
+    wsDisconnectToastTimer = null;
+  }
+  if(!wsDisconnectToastShown){
+    wsDisconnectToastTimer = setTimeout(function(){
+      wsDisconnectToastTimer = null;
+      if(websocket && websocket.readyState === WebSocket.OPEN) return;
+      notifyWsStatusToast('Потеряна связь с устройством. Пытаемся переподключиться...', true, 2000);
+      wsDisconnectToastShown = true;
+    }, 3500);
+  }
+  
+  console.log('WebSocket disconnected, reconnecting in', delay, 'ms (attempt', wserrcnt, ')');
   wstimeout=setTimeout(initWebSocket, delay);
 }
 function secondToTime(seconds){
@@ -229,6 +537,94 @@ function showById(show,hide){
   show.forEach(item=>{ getId(item).classList.remove('hidden'); });
   hide.forEach(item=>{ getId(item).classList.add('hidden'); });
 }
+
+// --- DLNA WebUI (этап E): HTTP к эндпоинтам этапа D; блок скрыт без dlnaSupported из variables.js. ---
+function dlnaPanelVisible(){
+  return typeof dlnaSupported !== 'undefined' && dlnaSupported;
+}
+function dlnaToast(msg, isErr){
+  // showToast создаётся при первом setupElement() с WS; до этого — не ломаем клик по DLNA.
+  if(typeof window.showToast === 'function') window.showToast(msg, !!isErr);
+  else if(typeof console !== 'undefined' && console.log) console.log(isErr ? '[DLNA] ' + msg : msg);
+}
+function dlnaParseLimit(){
+  var el = getId('dlna_limit');
+  var n = el ? parseInt(String(el.value).trim(), 10) : 200;
+  if(!isFinite(n) || n < 1) n = 200;
+  if(n > 65535) n = 65535;
+  return n;
+}
+function dlnaObjectIdParam(){
+  var el = getId('dlna_object_id');
+  var s = el ? String(el.value).trim() : '0';
+  return s.length ? s : '0';
+}
+function dlnaRefreshContainerList(){
+  if(!dlnaPanelVisible()) return;
+  var oid = encodeURIComponent(dlnaObjectIdParam());
+  fetch(`http://${hostname}/dlna/list?objectId=${oid}&start=0`).then(function(r){ return r.json(); }).then(function(j){
+    var ul = getId('dlna_container_list');
+    if(!ul) return;
+    ul.innerHTML = '';
+    if(j.items && j.items.length){
+      j.items.forEach(function(it){
+        var li = document.createElement('li');
+        li.textContent = (it.title != null ? String(it.title) : '') + (it.id != null ? '  ['+it.id+']' : '');
+        ul.appendChild(li);
+      });
+    }else{
+      var li0 = document.createElement('li');
+      li0.textContent = (j.note || 'Пустой список (полноценный browse — позже).');
+      ul.appendChild(li0);
+    }
+  }).catch(function(){
+    dlnaToast('DLNA list: ошибка сети', true);
+  });
+}
+function dlnaAfterSourceSwitch(){
+  setPlaylistMod();
+  generatePlaylist(`http://${hostname}/api/playlist?`+playlistmod);
+  sendWS('getindex=1', true);
+}
+function initDlnaPlayerUi(){
+  var wrap = getId('dlna_panel_wrap');
+  if(!wrap) return;
+  // Панель должна быть доступна только при поддержке DLNA и только в открытом окне эквалайзера.
+  if(!dlnaPanelVisible()){
+    wrap.classList.add('hidden');
+    return;
+  }
+  syncDlnaPanelUnderEqualizer();
+}
+function syncDlnaPanelUnderEqualizer(){
+  var wrap = getId('dlna_panel_wrap');
+  var eq = getId('equalizerbg');
+  if(!wrap || !eq) return;
+  // Временный UX-режим: DLNA скрыт на основном экране и показывается только под меню эквалайзера.
+  if(dlnaPanelVisible() && !eq.classList.contains('hidden')) wrap.classList.remove('hidden');
+  else wrap.classList.add('hidden');
+}
+function updateDlnaModeStrip(){
+  var strip = getId('dlna_mode_strip');
+  if(!strip) return;
+  if(modedlna){
+    strip.textContent = 'Источник: DLNA (UPnP)';
+    strip.classList.remove('hidden');
+  }else{
+    strip.textContent = '';
+    strip.classList.add('hidden');
+  }
+}
+
+function collapseDuplicateMetaText(v){
+  var s = (v != null && v !== undefined) ? String(v).trim() : '';
+  if(!s || isSystemMetaValue(s)) return s;
+  var m = s.match(/^(.+?)\s*-\s*\1$/i);
+  if(m && m[1] && m[1].trim().length > 8){
+    return m[1].trim();
+  }
+  return s;
+}
 function onMessage(event) {
   // [FIX v2] Сбрасываем таймер «смерти» при ЛЮБОМ сообщении от сервера.
   // Раньше он сбрасывался только при rssi (раз в 2 сек), и на мобильных
@@ -236,6 +632,7 @@ function onMessage(event) {
   // телефон пытался переподключиться, исчерпывал сокеты ESP32 → «Web умер».
   clearTimeout(pongtimeout);
   pingUp();
+  
   try{
     const data = JSON.parse(escapeData(event.data));
     /*ir*/
@@ -254,15 +651,31 @@ function onMessage(event) {
       setTimeout(function(){ window.location.href=data.redirect; }, 4000);
       return;
     }
-    if(typeof data.playermode !== 'undefined') { //Web, SD
+    if(typeof data.playermode !== 'undefined') { // Web, SD или DLNA (источник плейлиста)
+      // Вычисляем факт реального перехода режима.
+      // Повторный приход того же playermode часто случается при bootstrap/reconnect
+      // и не должен инициировать тяжёлую перерисовку.
+      const pm = data.playermode;
+      const nextModeSd = (pm === 'modesd');
+      const nextModedlna = (pm === 'modedlna');
+      // Смена SD↔WEB и смена WEB↔DLNA должны перезагрузить /api/playlist (разные CSV).
+      const modeActuallyChanged = (modesd !== nextModeSd) || (modedlna !== nextModedlna);
+      const needHeavyModeSync = (!playerModeBootstrapped) || modeActuallyChanged;
+
       // [FIX] Сбрасываем sdIndexingActive только при переходе в WEB-режим.
       // В SD-режиме НЕ сбрасываем — playermode может прийти раньше sdindexing=0.
-      if(data.playermode != 'modesd') sdIndexingActive = false;
-      // Оповещаем другие скрипты о начале/завершении потенциально тяжелой смены режима
-      document.dispatchEvent(new CustomEvent('modeSwitching', { detail: true }));
-      setTimeout(() => { document.dispatchEvent(new CustomEvent('modeSwitching', { detail: false })); }, 5000);
+      if(pm !== 'modesd') sdIndexingActive = false;
+      // Событие modeSwitching отправляем только при реальном переходе режима
+      // (или при первичной инициализации), чтобы не блокировать логику обложек ложными 5с окнами.
+      if(needHeavyModeSync){
+        document.dispatchEvent(new CustomEvent('modeSwitching', { detail: true }));
+        // Сокращаем окно "переключения" до короткого стабилизационного периода.
+        setTimeout(() => { document.dispatchEvent(new CustomEvent('modeSwitching', { detail: false })); }, 700);
+      }
 
-      modesd = data.playermode=='modesd';
+      modesd = nextModeSd;
+      modedlna = nextModedlna;
+      updateDlnaModeStrip();
       classEach('modeitem', function(el){ el.classList.add('hidden') });
       if(modesd) showById(['modesd', 'sdsvg'],['plsvg']); else showById(['modeweb','plsvg','bitinfo'],['sdsvg','snuffle']);
       showById(['volslider'],['sdslider']);
@@ -277,19 +690,24 @@ function onMessage(event) {
         if(sdActive || !modesd) genreBtn.classList.remove('hidden'); else genreBtn.classList.add('hidden');
       }
       getId('toggleplaylist').classList.remove('active');
-      setPlaylistMod();
-      // [FIX] Не загружаем плейлист, если SD-индексация ещё идёт —
-      // файл может быть не готов (404). sdindexing=0 перезагрузит позже.
-      if(!sdIndexingActive) {
-        generatePlaylist(`http://${hostname}/api/playlist`+"?"+playlistmod);
+      // Тяжёлые действия выполняем только при реальной смене режима (или на первом bootstrap).
+      if(needHeavyModeSync){
+        setPlaylistMod();
+        // Не загружаем плейлист, если SD-индексация ещё идёт —
+        // файл может быть не готов (404). sdindexing=0 перезагрузит позже.
+        if(!sdIndexingActive) {
+          generatePlaylist(`http://${hostname}/api/playlist`+"?"+playlistmod);
+        }
+        // При смене режима обновляем обложку через логотип, чтобы исключить артефакты старого трека.
+        const logo = getId('logo');
+        const cover = getId('cover-art-display');
+        if(logo) logo.style.display = 'flex';
+        if(cover){ cover.style.display = 'none'; cover.innerHTML = ''; }
+        // Сбросить глобальное состояние TrackFacts (если доступно).
+        if(typeof window.resetTrackFacts === 'function') window.resetTrackFacts();
       }
-      // При смене режима принудительно обновляем обложку (сбрасываем в логотип).
-      const logo = getId('logo');
-      const cover = getId('cover-art-display');
-      if(logo) logo.style.display = 'flex';
-      if(cover){ cover.style.display = 'none'; cover.innerHTML = ''; }
-      // Сбросить глобальное состояние TrackFacts (если доступно)
-      if(typeof window.resetTrackFacts === 'function') window.resetTrackFacts();
+      // Фиксируем, что первичный playermode уже обработан.
+      playerModeBootstrapped = true;
       return;
     }
     if(typeof data.sdinit !== 'undefined') {
@@ -345,7 +763,9 @@ function onMessage(event) {
     /* [v0.4.2] Обработка Toast-уведомлений от TrackFacts и системы */
     if(typeof data.toast !== 'undefined'){
       showToast(data.toast, data.isErr === 1);
-      
+      // [FIX] Если сервер явно отклонил ручной запрос факта, диалог больше не нужен:
+      // пользователь уже получил причину отказа во всплывающем сообщении.
+      // Закрываем диалог сразу, чтобы не оставлять "висящий" экран ожидания.
       if (data.isErr === 1 && typeof data.toast === 'string' &&
           data.toast.indexOf('Запрос факта отклонён') !== -1) {
         closeFactsDialog();
@@ -357,26 +777,33 @@ function onMessage(event) {
       return;
     }
     if(typeof data.payload !== 'undefined'){
+      // Сначала индекс станции, потом поля payload — иначе nameset из того же кадра берёт fromPl по старому currentItem.
+      if(typeof data.current !== 'undefined'){
+        setCurrentItem(data.current);
+      }
       data.payload.forEach(item=> {
         setupElement(item.id, item.value);
       });
+      if(typeof data.act !== 'undefined'){
+        applySettingsActFromServer(data.act);
+      }
+      if(typeof data.current !== 'undefined'){
+        setCurrentItem(data.current);
+      }
     }else{
-      if(typeof data.current !== 'undefined') { setCurrentItem(data.current); return; }
+      if(typeof data.current !== 'undefined') {
+        setCurrentItem(data.current);
+      }
       if(typeof data.file !== 'undefined') { setPlaylistMod(); generatePlaylist(data.file+"?"+playlistmod); sendWS('submitplaylistdone=1', true); return; }
-        if(typeof data.act !== 'undefined'){
-          // Если мы на settings — act подтверждает, что меню реально разморожено.
-          if(window.location.pathname=='/settings.html'){
-            settingsActReceived = true;
-            clearTimeout(settingsActRetryTimer);
-          }
-          data.act.forEach(showclass=> { classEach(showclass, function(el) { el.classList.remove("hidden"); }); });
-          return;
-        }
+      if(typeof data.act !== 'undefined'){
+        applySettingsActFromServer(data.act);
+      }
       if(typeof data.mdns !== 'undefined'){
         const rhost = (hostname==`${data.mdns}.local`)?data.ipaddr:`${data.mdns}.local`;
         getId("radiolink").innerHTML=`<a href="http://${rhost}/settings.html">http://${rhost}/</a>`;
       }
       Object.keys(data).forEach(key=>{
+        if(key === 'act') return;
         setupElement(key, data[key]);
       });
     }
@@ -435,7 +862,40 @@ function isSystemMetaValue(value){
   if(value.startsWith('[')) return true;
   if(value.indexOf('Индексация SD') !== -1) return true;
   if(value.indexOf('Загрузка плейлиста') !== -1) return true;
+  if(value.indexOf('Переподключение') !== -1) return true;
+  if(value.indexOf('Error') !== -1) return true;
+  if(value.indexOf('Ошибка') !== -1) return true;
   return false;
+}
+/** true, если строка точно совпадает с именем другой (не текущей) станции в плейлисте — типичный запоздалый nameset после смены частоты. */
+function namesetMatchesOtherPlaylistRow(name, curIdx){
+  var pl = getId('playlist');
+  if(!pl || curIdx == null || curIdx === '') return false;
+  var n = String(name == null ? '' : name).trim();
+  if(!n) return false;
+  var cur = parseInt(curIdx, 10);
+  if(isNaN(cur)) return false;
+  var hit = false;
+  pl.querySelectorAll('li').forEach(function(li){
+    var aid = parseInt(li.getAttribute('attr-id'), 10);
+    if(isNaN(aid) || aid === cur) return;
+    var nm = (li.dataset && li.dataset.name) ? String(li.dataset.name).trim() : '';
+    if(nm && nm === n) hit = true;
+  });
+  return hit;
+}
+// Видимость #cpubar: прошивка (window.__webCpuBuild) и пользовательский флаг (window.__webCpuUser).
+// Пока webcpu из getsystem не пришёл — не трогаем полоску (избегаем гонки wci раньше webcpu).
+function applyWebCpuBarVisibility(){
+  var bar = getId('cpubar');
+  if(!bar) return;
+  if(window.__webCpuBuild === undefined) return;
+  var buildOn = (window.__webCpuBuild === true || window.__webCpuBuild === 1);
+  var userOn = (window.__webCpuUser === undefined || window.__webCpuUser === null)
+    ? true
+    : (window.__webCpuUser === true || window.__webCpuUser === 1 || window.__webCpuUser === '1');
+  if(buildOn && userOn) bar.classList.remove('hidden');
+  else bar.classList.add('hidden');
 }
 function setupElement(id, value){
   //console.log(`Updating element: id=${id}, value=${value}`); // Debug log
@@ -492,12 +952,47 @@ function setupElement(id, value){
     return;
   }
 
+  // webcpu — прошивка с WEBUI_CPU_BAR_ENABLE: показываем переключатель #wci на /settings; видимость полоски — ещё и wci.
+  if (id === 'webcpu') {
+    const en = (value === 1 || value === true || value === '1');
+    window.__webCpuBuild = en;
+    const cpuCb = getId('wci');
+    if (cpuCb) {
+      if (en) cpuCb.classList.remove('hidden');
+      else cpuCb.classList.add('hidden');
+    }
+    applyWebCpuBarVisibility();
+    return;
+  }
+  // wci — сохранённое «CPU Info» (полоска внизу плеера).
+  if (id === 'wci') {
+    window.__webCpuUser = (value === 1 || value === true || value === '1');
+    applyWebCpuBarVisibility();
+    const el = getId('wci');
+    if (el && el.classList.contains('checkbox')) {
+      el.classList.remove('checked');
+      if (window.__webCpuUser) el.classList.add('checked');
+    }
+    return;
+  }
+
   if(element){
     if(id=="heap"){
+      // Вне экрана плеера не показываем динамические полосы — иначе это выглядит как «симуляция» при update/settings.
+      if(!['/','/index.html'].includes(window.location.pathname)) return;
       // Ширина — фактический процент буфера.
       element.style.width=`${value}%`;
       // Цвет — по заданным порогам; сама плавность перехода обеспечивается CSS transition у #heap.
       element.style.backgroundColor = getHeapColorByPercent(value);
+      return;
+    }
+    if(id=="cpubar"){
+      // Вне экрана плеера не показываем CPU bar (исключает «ползущую полоску» на /update.html при прошивке/ребуте).
+      if(!['/','/index.html'].includes(window.location.pathname)) return;
+      // Сервер шлёт cpubar только при WEBUI_CPU_BAR_ENABLE — снимаем hidden, если getsystem ещё не успел (редкий порядок сообщений).
+      if (element.classList.contains('hidden')) element.classList.remove('hidden');
+      element.style.width=`${value}%`;
+      element.style.backgroundColor = getCpuBarColorByPercent(value);
       return;
     }
     if(element.classList.contains("checkbox")){
@@ -507,19 +1002,62 @@ function setupElement(id, value){
     if(element.classList.contains("classchange")){
       element.attr("class", "classchange");
       element.classList.add(value);
-
+      // [FIX] При STOP немедленно очищаем мета-данные и сбрасываем обложку
       if(id === 'playerwrap' && value === 'stopped') {
         // Сброс обложки на логотип
         var logoEl = getId('logo');
         var coverEl = getId('cover-art-display');
         if(logoEl) logoEl.style.display = 'flex';
         if(coverEl){ coverEl.style.display = 'none'; coverEl.innerHTML = ''; }
+        if(typeof closeFactsDialog === 'function') closeFactsDialog();
         if(typeof window.resetTrackFacts === 'function') window.resetTrackFacts();
       }
       // [FIX Задача 2] При начале воспроизведения — если плейлист пуст, перезагружаем его.
       // Покрывает случай: страница загрузилась во время индексации SD, плейлист был пустой,
       // событие sdindexing=0 пропущено или пришло раньше готовности данных.
       if(id === 'playerwrap' && value === 'playing') {
+        // Если пользователь нажал PLAY после STOP (без смены станции),
+        // показываем station-info коротким окном, как и при switch станции.
+        // Это убирает "моргание" и делает поведение единым.
+        var nsOnPlay = getId('nameset');
+        var metaOnPlay = getId('meta');
+        var stationOnPlay = nsOnPlay ? String(nsOnPlay.textContent || '').trim() : '';
+        if(metaOnPlay && stationOnPlay){
+          var currentMetaOnPlay = String(metaOnPlay.innerText || '').trim();
+          if(isSystemMetaValue(currentMetaOnPlay) || !currentMetaOnPlay){
+            // --- Вторая строка при старте PLAY без готового TITLE из WS ---
+            // Пока нет тега из потока: берём из текущей строки плейлиста жанр (если не «all» и не дубль nameset),
+            // иначе коротко показываем hostname потока (если отличается от названия станции);
+            // если и этого нет — явный статус [соединение], чтобы строка не оставалась пустой.
+            var plForPlay = getId('playlist');
+            var rowPlay = plForPlay ? plForPlay.querySelector('li[attr-id="'+currentItem+'"]') : null;
+            var gPlay = (rowPlay && rowPlay.dataset && rowPlay.dataset.genre) ? String(rowPlay.dataset.genre).trim() : '';
+            var urlPlay = (rowPlay && rowPlay.dataset && rowPlay.dataset.url) ? String(rowPlay.dataset.url).trim() : '';
+            var secondLinePlay = '';
+            if(gPlay && gPlay.length && gPlay.toLowerCase() !== 'all' &&
+               gPlay.toLowerCase() !== stationOnPlay.toLowerCase()){
+              secondLinePlay = gPlay;
+            } else if(urlPlay){
+              try{
+                var uPlay = new URL(urlPlay.indexOf('http') === 0 ? urlPlay : 'http://' + urlPlay);
+                var hPlay = (uPlay.hostname || '').trim();
+                if(hPlay && hPlay.toLowerCase() !== stationOnPlay.toLowerCase()) secondLinePlay = hPlay;
+              }catch(ePl){}
+            }
+            metaOnPlay.innerText = secondLinePlay || '[соединение]';
+          }
+          window.__metaCoverHoldUntilMs = Date.now() + 4000;
+          window.__metaHoldText = '';
+          window.__metaHoldPendingMeta = '';
+          if(window.__metaCoverDeferredTimer){
+            clearTimeout(window.__metaCoverDeferredTimer);
+            window.__metaCoverDeferredTimer = null;
+          }
+          if(window.__metaHoldWsTimer){
+            clearTimeout(window.__metaHoldWsTimer);
+            window.__metaHoldWsTimer = null;
+          }
+        }
         setTimeout(function() {
           var pl = getId('playlist');
           if(pl && pl.querySelectorAll('li').length === 0) {
@@ -532,27 +1070,118 @@ function setupElement(id, value){
     if(element.classList.contains("text")){
       if(id=='meta'){
         var now = Date.now();
-        if(now - lastMetaUpdate < META_NAMESET_THROTTLE_MS) return;
-        lastMetaUpdate = now;
-      }
-      if(id=='nameset'){
-        var now = Date.now();
-        if(now - lastNamesetUpdate < META_NAMESET_THROTTLE_MS) return;
-        lastNamesetUpdate = now;
+        var metaStrPre = (value != null && value !== undefined) ? String(value) : '';
+        // Если после смены станции включено окно удержания station-info,
+        // не переключаемся мгновенно на трековый TITLE из WS.
+        // Это синхронизирует поведение с вариантом B (4 секунды station-info).
+        var holdLeftWsMs = Math.max(0, (window.__metaCoverHoldUntilMs || 0) - now);
+        var nsForWs = getId('nameset');
+        var nsTxtForWs = nsForWs ? String(nsForWs.textContent || '').trim() : '';
+        var metaTxtForWs = metaStrPre.trim();
+        var isWsSystem = isSystemMetaValue(metaStrPre);
+        var isDuplicateWs = metaTxtForWs && nsTxtForWs &&
+          (metaTxtForWs.toLowerCase() === nsTxtForWs.toLowerCase());
+        if(!isWsSystem && holdLeftWsMs > 0 && metaTxtForWs && !isDuplicateWs){
+          // Строгий hold: 4 секунды держим текущую station-info строку.
+          // В этом окне только запоминаем последнее meta для применения ПОСЛЕ hold.
+          window.__metaHoldPendingMeta = metaTxtForWs;
+          if(!window.__metaHoldWsTimer){
+            window.__metaHoldWsTimer = setTimeout(function(){
+              var m = getId('meta');
+              if(!m){
+                window.__metaHoldWsTimer = null;
+                window.__metaHoldPendingMeta = '';
+                return;
+              }
+              var pending = String(window.__metaHoldPendingMeta || '').trim();
+              if(pending && !isSystemMetaValue(pending)){
+                m.innerText = pending;
+                lastMetaUpdate = Date.now();
+              }
+              window.__metaHoldWsTimer = null;
+              window.__metaHoldPendingMeta = '';
+            }, holdLeftWsMs);
+          }
+          return;
+        }
+        var metaIncomingTrim = metaStrPre.trim();
+        var metaCurrentTrim = (element.textContent || '').trim();
+        // [остановлено], [готов], [соединение] и др. — не троттлим: иначе после частых треков статус Stop не попадёт в #meta.
+        if(!isSystemMetaValue(metaStrPre)) {
+          // Троттлим только повторы одного и того же текста.
+          // Если пришёл новый тег, показываем его сразу (даже если он пришёл вскоре после комментария/статуса).
+          if(metaIncomingTrim === metaCurrentTrim && (now - lastMetaUpdate < META_NAMESET_THROTTLE_MS)) return;
+          lastMetaUpdate = now;
+        }
       }
       if(id=='meta'){
-        if(sdIndexingActive && !isSystemMetaValue(value)) return;
+        if(sdIndexingActive && !isSystemMetaValue((value != null && value !== undefined) ? String(value) : '')) return;
+        // [FIX] Улучшенная обработка статусов при остановленном плеере
+        // Разрешаем обновлять критические статусы даже при остановленном плеере
         if(getId('playerwrap') && getId('playerwrap').classList.contains('stopped')) {
-          if(value && value.length > 0 && !value.startsWith('[')) return;
+          var currentMetaText = (element.textContent || '').trim();
+          var msv = (value != null && value !== undefined) ? String(value) : '';
+          if(msv.length > 0) {
+            // Разрешаем обновление критических системных статусов
+            var isCriticalStatus = 
+              msv.indexOf('[соединение]') !== -1 ||
+              msv.indexOf('[остановлено]') !== -1 ||
+              msv.indexOf('[готов]') !== -1 ||
+              msv.indexOf('[Error]') !== -1 ||
+              msv.indexOf('[Ошибка]') !== -1;
+            
+            // Запрещаем только обычные метаданные при остановленном плеере, если это тот же текст
+            // (повтор/дребезг). Новый тег (другая строка) пропускаем — иначе при гонке MODE/TITLE
+            // после смены станции тег теряется и висит старый до смены композиции в эфире.
+            var msvTrim = msv.trim();
+            if(!isSystemMetaValue(msv) && !isCriticalStatus && currentMetaText !== '[соединение]' &&
+               (msvTrim === currentMetaText || msvTrim.length === 0)) return;
+            if(msv.indexOf('[соедин') !== -1 && currentMetaText === '[остановлено]') return;
+          }
         }
       }
       let finalValue = value;
-      if(id=='nameset'){
-        if(value && value.trim().length > 0) {
-          lastNamesetText = value;
-        } else if(lastNamesetText) {
-          finalValue = lastNamesetText;
+      if(id=='meta'){
+        finalValue = collapseDuplicateMetaText(finalValue);
+        // Если строка meta совпадает с nameset — не дублируем; показываем [соединение] до отличного тега из потока.
+        var nsForMeta = getId('nameset');
+        var nsTxtForMeta = nsForMeta ? String(nsForMeta.textContent || '').trim() : '';
+        var metaTxtForCompare = (finalValue != null && finalValue !== undefined) ? String(finalValue).trim() : '';
+        var holdLeftForDedupe = Math.max(0, (window.__metaCoverHoldUntilMs || 0) - Date.now());
+        if(holdLeftForDedupe <= 0 &&
+           metaTxtForCompare &&
+           nsTxtForMeta &&
+           !isSystemMetaValue(metaTxtForCompare) &&
+           metaTxtForCompare.toLowerCase() === nsTxtForMeta.toLowerCase()){
+          // Дубль первой строки — не оставляем пустоту: до прихода реального тега показываем статус соединения.
+          finalValue = '[соединение]';
         }
+      }
+      if(id=='nameset'){
+        var rawNs = (value != null && value !== undefined) ? String(value).trim() : '';
+        var plN = getId('playlist');
+        var rowN = plN ? plN.querySelector('li[attr-id="'+currentItem+'"]') : null;
+        var fromPl = (rowN && rowN.dataset && rowN.dataset.name) ? String(rowN.dataset.name).trim() : '';
+        if(rawNs.length > 0) {
+          // Запоздалый STATIONNAME с именем прошлой станции (тот же текст, что у другой строки плейлиста) — не затирать текущую.
+          if(fromPl && rawNs !== fromPl && namesetMatchesOtherPlaylistRow(rawNs, currentItem)) {
+            finalValue = fromPl;
+            lastNamesetText = fromPl;
+          } else {
+            lastNamesetText = rawNs;
+            finalValue = rawNs;
+          }
+        } else {
+          // Пустой nameset от ESP при смене станции — не подставлять прошлое имя; взять строку текущей позиции из плейлиста.
+          finalValue = fromPl;
+          lastNamesetText = fromPl;
+        }
+        var nowNs = Date.now();
+        var shownNs = (element.textContent || '').trim();
+        if(String(finalValue).trim() === shownNs && shownNs !== '') {
+          if(nowNs - lastNamesetUpdate < META_NAMESET_THROTTLE_MS) return;
+        }
+        lastNamesetUpdate = nowNs;
       }
       element.innerText=finalValue;
       // setCurrentItem при meta/nameset не вызываем — подсветка/скролл только по data.current и при загрузке плейлиста
@@ -669,22 +1298,152 @@ function renderSleepTimerButton() {
 }
 /***--- playlist ---***/
 function setCurrentItem(item){
-  currentItem=item;
   const playlist = getId("playlist");
+  // На /settings.html и др. страницах без плейлиста не трогаем индекс — иначе exception рвёт onMessage
+  // и не отрабатывает payload того же кадра (чекбоксы остаются в HTML-дефолте до F5).
+  if(!playlist) return;
+  var idx = typeof item === 'number' ? item : parseInt(item, 10);
+  if(isNaN(idx)) idx = currentItem;
+  var changed = idx !== currentItem;
+  if(changed){
+    lastNamesetText = '';
+    lastNamesetUpdate = 0;
+    // При смене станции сбрасываем строку трега: иначе до прихода нового TITLE
+    // остаётся текст прошлой станции и создаётся впечатление «скрипт не подгрузился».
+    var metaOnSwitch = getId('meta');
+    if(metaOnSwitch){
+      // Если плеер остановлен — только фиксируем статус в #meta; НИКОГДА не делаем return из setCurrentItem,
+      // иначе не обновятся currentItem и подсветка плейлиста (плейлист «пропадает» / ломается логика WS).
+      var wrap = getId('playerwrap');
+      if(wrap && wrap.classList.contains('stopped')){
+        metaOnSwitch.innerText = '[остановлено]';
+        lastMetaUpdate = 0;
+      } else {
+      // Не оставляем #meta пустым при переключении станции в режиме воспроизведения.
+      // Приоритет UX (как раньше): кратко показать инфо станции, затем title из /api/current-cover;
+      // если title совпадает с именем станции — не дублировать второй строкой (см. ниже dedupe в setupElement).
+      var stationMetaFallback = '';
+      var rowMeta = playlist.querySelector('li[attr-id="'+idx+'"]');
+      if(rowMeta && rowMeta.dataset && rowMeta.dataset.name){
+        stationMetaFallback = String(rowMeta.dataset.name).trim();
+      }
+      metaOnSwitch.innerText = stationMetaFallback || '[соединение]';
+      lastMetaUpdate = 0;
+      // Окно удержания: сглаживаем гонку WS-кадров при смене станции.
+      window.__metaCoverHoldUntilMs = Date.now() + 4000;
+      window.__metaHoldText = '';
+      window.__metaHoldPendingMeta = '';
+      if(window.__metaCoverDeferredTimer){
+        clearTimeout(window.__metaCoverDeferredTimer);
+        window.__metaCoverDeferredTimer = null;
+      }
+
+      // Вариант B: синхронизируем #meta с тем, что соответствует текущей обложке.
+      if(typeof window.__metaCoverAbortController !== 'undefined' && window.__metaCoverAbortController){
+        try{ window.__metaCoverAbortController.abort(); }catch(e){}
+      }
+      var canAbort = (typeof AbortController !== 'undefined');
+      var ac = canAbort ? new AbortController() : null;
+      window.__metaCoverAbortController = ac;
+      if(typeof window.__metaCoverSyncSeq !== 'undefined') {
+        window.__metaCoverSyncSeq++;
+      } else {
+        window.__metaCoverSyncSeq = 1;
+      }
+      var mySeq = window.__metaCoverSyncSeq;
+
+      var coverFetchTimeout = setTimeout(function(){
+        if(window.__metaCoverAbortController){
+          try{ window.__metaCoverAbortController.abort(); }catch(e){}
+        }
+      }, 2500);
+
+      fetch('/api/current-cover?t=' + Date.now(), ac ? { signal: ac.signal } : undefined)
+        .then(function(r){ if(!r || !r.ok) throw new Error('cover fetch'); return r.json(); })
+        .then(function(data){
+          if(mySeq !== window.__metaCoverSyncSeq) return;
+          if(!metaOnSwitch) return;
+          clearTimeout(coverFetchTimeout);
+          var titleFromCover = (data && data.title) ? String(data.title).trim() : '';
+          if(titleFromCover && !isSystemMetaValue(titleFromCover)){
+            var titleLooksSameAsStation =
+              stationMetaFallback &&
+              titleFromCover.toLowerCase() === stationMetaFallback.toLowerCase();
+            var holdLeftMs = Math.max(0, (window.__metaCoverHoldUntilMs || 0) - Date.now());
+            if(!titleLooksSameAsStation && holdLeftMs > 0){
+              window.__metaCoverDeferredTimer = setTimeout(function(){
+                if(mySeq !== window.__metaCoverSyncSeq) return;
+                if(!metaOnSwitch) return;
+                metaOnSwitch.innerText = titleFromCover;
+                lastMetaUpdate = Date.now();
+                window.__metaCoverDeferredTimer = null;
+              }, holdLeftMs);
+            } else {
+              metaOnSwitch.innerText = titleFromCover;
+              lastMetaUpdate = Date.now();
+            }
+            return;
+          }
+          var ns = getId('nameset');
+          if(ns && ns.textContent){
+            var nsTxt = String(ns.textContent).trim();
+            // Не копируем nameset во вторую строку, если это то же имя, что у активной строки плейлиста.
+            var dupPl = stationMetaFallback && nsTxt.toLowerCase() === stationMetaFallback.toLowerCase();
+            metaOnSwitch.innerText = (nsTxt && !dupPl) ? nsTxt : '[соединение]';
+          } else if (stationMetaFallback) {
+            metaOnSwitch.innerText = stationMetaFallback;
+          } else {
+            metaOnSwitch.innerText = '[соединение]';
+          }
+        })
+        .catch(function(){
+          // Ошибка cover API — оставляем уже показанный fallback (stationMetaFallback / [соединение]).
+        });
+      }
+    }
+  }
+  currentItem = idx;
   let topPos = 0, lih = 0;
   playlist.querySelectorAll('li').forEach((item, index)=>{
       // Не перезаписываем class целиком: иначе теряются служебные классы фильтров
       // (например, .search-hidden), и поиск "ломается" после первого запуска/PLAY.
       item.classList.add("play");
       item.classList.remove("active");
-      if(index+1==currentItem){
+      if(index+1===currentItem){
           item.classList.add("active");
           topPos = item.offsetTop;
           lih = item.offsetHeight;
       }
   });
-  // Мгновенный скролл: 'smooth' при частых обновлениях давал дёргание при движении курсора
-  playlist.scrollTo({ top: (topPos-playlist.offsetHeight/2+lih/2), left: 0, behavior: 'auto' });
+  // Центрируем активную строку в плейлисте.
+  // В некоторых Android-браузерах `scrollTo({top,...})` иногда игнорируется — используем `scrollTop`.
+  var desiredTop = (topPos - playlist.offsetHeight/2 + lih/2);
+  if(desiredTop < 0) desiredTop = 0;
+  var maxTop = playlist.scrollHeight - playlist.clientHeight;
+  if(maxTop < 0) maxTop = 0;
+  if(desiredTop > maxTop) desiredTop = maxTop;
+  if (typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(function(){
+      playlist.scrollTop = desiredTop;
+    });
+  } else {
+    playlist.scrollTop = desiredTop;
+  }
+  // Имя станции из плейлиста — опора при каждом {"current":N}: иначе запоздалый nameset оставлял прошлую станцию при том же индексе.
+  var nsSync = getId('nameset');
+  if(playlist && nsSync){
+    var rowS = playlist.querySelector('li[attr-id="'+idx+'"]');
+    if(rowS && rowS.dataset && rowS.dataset.name){
+      var nmS = String(rowS.dataset.name).trim();
+      if(nmS){
+        nsSync.textContent = nmS;
+        lastNamesetText = nmS;
+        lastNamesetUpdate = Date.now();
+      }
+    }else if(changed){
+      nsSync.textContent = '';
+    }
+  }
 }
 function initPLEditor(){
   ple= getId('pleditorcontent');
@@ -699,36 +1458,37 @@ function initPLEditor(){
     let pGenre = item.dataset.genre || '';
     let pFavorite = item.dataset.favorite || '0';
     
-    html+=`<li class="pleitem" id="${'plitem'+index}"><span class="grabbable" draggable="true">${("00"+(index+1)).slice(-3)}</span>
+    html+=`<li class="pleitem" id="${'plitem'+index}"><span class="grabbable" draggable="true">${String(index+1).padStart(3, '0')}</span>
       <span class="pleinput plecheck"><input type="checkbox" class="plcb" /></span>
       <input class="pleinput plename" type="text" value="${quoteattr(pName)}" maxlength="140" />
       <input class="pleinput pleurl" type="text" value="${pUrl}" maxlength="140" />
       <span class="pleinput pleplay" data-command="preview">&#9658;</span>
       <input class="pleinput pleovol" type="number" min="-64" max="64" step="1" value="${pOvol}" />
-      <input class="pleinput plegenre" type="text" value="${pGenre}" maxlength="50" onchange="autoSaveGenre(this)" />
+      <input class="pleinput plegenre" type="text" value="${quoteattr(pGenre)}" maxlength="50" onchange="autoSaveGenre(this)" onblur="autoSaveGenre(this)" />
       <input class="pleinput plefavorite" type="number" min="0" max="1" step="1" value="${pFavorite}" />
       </li>`;
   });
   ple.innerHTML=html;
 }
 
-/* AUTO-SAVE FUNCTION for Genres */
+/* AUTO-SAVE FUNCTION for Genres (debounce — onchange + быстрый ввод) */
+var genreSaveTimer = null;
 function autoSaveGenre(input) {
-  // Update the dataset of the corresponding playlist item
   let liIndex = input.closest('li').id.replace('plitem', '');
   let playlistItem = getId('playlist').children[liIndex];
   if (playlistItem) {
     playlistItem.dataset.genre = input.value;
     playlistItem.setAttribute('data-genre', input.value);
   }
-  // Trigger silent save
-  submitPlaylist(true); 
+  clearTimeout(genreSaveTimer);
+  genreSaveTimer = setTimeout(function(){ submitPlaylist(true); }, 500);
 }
 
 function handlePlaylistData(fileData) {
   const ul = getId('playlist');
+  if(!ul) return;
   ul.innerHTML='';
-  if (!fileData) return;
+  if (!fileData || !String(fileData).trim()) return;
   const lines = fileData.split('\n');
   let li='', html='';
   for(var i = 0;i < lines.length;i++){
@@ -750,13 +1510,44 @@ function handlePlaylistData(fileData) {
     }
   }
   ul.innerHTML=html;
+  if(!html.length){
+    var metaPl = getId('meta');
+    if(metaPl) metaPl.innerText = 'Плейлист пуст или файл не содержит станций';
+  }
   setCurrentItem(currentItem);
   // Если поиск уже открыт/введён, применяем фильтр повторно после перезагрузки плейлиста.
   // Это сохраняет результаты поиска и позволяет делать повторные поиски без F5.
   filterPlaylistBySearch();
   updateGenreList();
-  if(!modesd) initPLEditor();
-  bigplaylist = false;
+  // Всегда пересобираем строки редактора из актуального #playlist (и WEB, и SD).
+  // Раньше в SD initPLEditor() не вызывался — pleditorcontent оставался старым, и следующий
+  // submitPlaylist (избранное и т.д.) перезаписывал playlist.csv без жанров.
+  if (getId('pleditorcontent')) initPLEditor();
+  // Успешная отрисовка плейлиста: сбрасываем отложенные ретраи и счётчик.
+  if(playlistRetryTimer){
+    clearTimeout(playlistRetryTimer);
+    playlistRetryTimer = null;
+  }
+  playlistRetryCount = 0;
+  if(playlistDomWaitTimer){
+    clearTimeout(playlistDomWaitTimer);
+    playlistDomWaitTimer = null;
+  }
+  playlistDomWaitCount = 0;
+}
+
+function schedulePlaylistRetry(path){
+  // Не уходим в бесконечный цикл: максимум PLAYLIST_RETRY_MAX попыток.
+  if(playlistRetryCount >= PLAYLIST_RETRY_MAX) return;
+  playlistRetryCount++;
+  if(playlistRetryTimer){
+    clearTimeout(playlistRetryTimer);
+    playlistRetryTimer = null;
+  }
+  // Через короткую паузу пробуем ещё раз тот же URL плейлиста.
+  playlistRetryTimer = setTimeout(function(){
+    generatePlaylist(path);
+  }, PLAYLIST_RETRY_DELAY_MS);
 }
 
 function generatePlaylist(path){
@@ -764,14 +1555,39 @@ function generatePlaylist(path){
   if(bigplaylist) return;
   path = path.replace(/:\/\/.+?\//, `://${hostname}/`);
   var plEl = getId('playlist');
+  // Нет контейнера — шелл ещё не подгрузился; короткие повторы, без «тихого» return и без лимита ретраев пустого API.
+  if(!plEl){
+    if(playlistDomWaitCount >= PLAYLIST_DOM_WAIT_MAX){
+      playlistDomWaitCount = 0;
+      return;
+    }
+    playlistDomWaitCount++;
+    if(playlistDomWaitTimer){ clearTimeout(playlistDomWaitTimer); playlistDomWaitTimer = null; }
+    playlistDomWaitTimer = setTimeout(function(){
+      playlistDomWaitTimer = null;
+      generatePlaylist(path);
+    }, PLAYLIST_DOM_WAIT_MS);
+    return;
+  }
+  playlistDomWaitCount = 0;
   var savedHtml = plEl.innerHTML;
-  plEl.innerHTML='<div id="progress"><span id="loader"></span></div>';
+  plEl.innerHTML='<div class="pl-load-overlay"><span class="pl-load-spin"></span></div>';
   bigplaylist = true;
   fetch(path).then(response => response.text()).then(plcontent => {
-    handlePlaylistData(plcontent);
+    var txt = (plcontent != null) ? String(plcontent) : '';
+    if(!txt.trim()){
+      // Пустой ответ на старте: оставляем прежний DOM и планируем авто-повтор,
+      // чтобы плейлист появился сам после прогрузки устройства, без F5.
+      plEl.innerHTML = savedHtml;
+      schedulePlaylistRetry(path);
+      return;
+    }
+    handlePlaylistData(txt);
   }).catch(() => {
-    // При ошибке (таймаут, занятый LittleFS при избранном и т.д.) не очищаем список — восстанавливаем.
+    // Сетевой сбой/таймаут на старте: восстанавливаем DOM и делаем ограниченный авто-повтор.
     plEl.innerHTML = savedHtml;
+    schedulePlaylistRetry(path);
+  }).finally(function(){
     bigplaylist = false;
   });
 }
@@ -945,13 +1761,13 @@ function plAdd(){
   let cnt=ple.getElementsByTagName('li');
   plitem.attr('class', 'pleitem');
   plitem.attr('id', 'plitem'+(cnt.length));
-  plitem.innerHTML = '<span class="grabbable" draggable="true">'+("00"+(cnt.length+1)).slice(-3)+'</span>\
+  plitem.innerHTML = '<span class="grabbable" draggable="true">'+String(cnt.length+1).padStart(3, '0')+'</span>\
       <span class="pleinput plecheck"><input type="checkbox" /></span>\
       <input class="pleinput plename" type="text" value="" maxlength="140" />\
       <input class="pleinput pleurl" type="text" value="" maxlength="140" />\
       <span class="pleinput pleplay" data-command="preview">&#9658;</span>\
       <input class="pleinput pleovol" type="number" min="-30" max="30" step="1" value="0" />\
-      <input class="pleinput plegenre" type="text" value="" maxlength="50" onchange="autoSaveGenre(this)" />\
+      <input class="pleinput plegenre" type="text" value="" maxlength="50" onchange="autoSaveGenre(this)" onblur="autoSaveGenre(this)" />\
       <input class="pleinput plefavorite" type="number" min="0" max="1" step="1" value="0" />';
   ple.appendChild(plitem);
   ple.scrollTo({
@@ -978,7 +1794,7 @@ function plRemove(){
   }
   items=getId('pleditorcontent').getElementsByTagName('li');
   for (let i = 0; i <= items.length-1; i++) {
-    items[i].getElementsByTagName('span')[0].innerText=("00"+(i+1)).slice(-3);
+    items[i].getElementsByTagName('span')[0].innerText=String(i+1).padStart(3, '0');
   }
 }
 function submitPlaylist(silent = false){
@@ -991,14 +1807,20 @@ function submitPlaylist(silent = false){
   }
   var output="";
   for (var i = 0; i <= items.length - 1; i++) {
-    inputs=items[i].getElementsByTagName("input");
-    if(inputs[1].value == "" || inputs[2].value == "") continue;
-    let ovol = inputs[3].value;
+    var row = items[i];
+    var elName = row.querySelector('.plename');
+    var elUrl = row.querySelector('.pleurl');
+    var elOvol = row.querySelector('.pleovol');
+    var elGenre = row.querySelector('.plegenre');
+    var elFav = row.querySelector('.plefavorite');
+    if(!elName || !elUrl || !elOvol) continue;
+    if(elName.value == "" || elUrl.value == "") continue;
+    let ovol = elOvol.value;
     if(ovol < -30) ovol = -30;
     if(ovol > 30) ovol = 30;
-    let genre = inputs[4] ? inputs[4].value : '';
-    let favorite = inputs[5] ? inputs[5].value : '0';
-    output+=inputs[1].value+"\t"+inputs[2].value+"\t"+inputs[3].value+"\t"+genre+"\t"+favorite+"\n";
+    let genre = elGenre ? elGenre.value : '';
+    let favorite = elFav ? elFav.value : '0';
+    output+=elName.value+"\t"+elUrl.value+"\t"+ovol+"\t"+genre+"\t"+favorite+"\n";
   }
   let file = new File([output], "tempplaylist.csv",{type:"text/plain;charset=utf-8", lastModified:new Date().getTime()});
   let container = new DataTransfer();
@@ -1044,15 +1866,22 @@ function toggleTarget(el, id){
       getId('snuffle').classList.toggle('hidden');
     }else target.classList.toggle("hidden");
     getId(target.dataset.target).classList.toggle("active");
+    // После открытия/закрытия эквалайзера синхронизируем видимость DLNA-блока.
+    if(id=='equalizerbg') syncDlnaPanelUnderEqualizer();
   }
 }
 function checkboxClick(cb, command){
   cb.classList.toggle("checked");
-  sendWS(`${command}=${cb.classList.contains("checked")?1:0}`);
+  sendWS(`${command}=${cb.classList.contains("checked")?1:0}`, true);
 }
+var _sliderWsDebounce = {};
 function sliderInput(sl, command){
-  sendWS(`${command}=${sl.value}`);
   fillSlider(sl);
+  clearTimeout(_sliderWsDebounce[command]);
+  _sliderWsDebounce[command] = setTimeout(function(){
+    delete _sliderWsDebounce[command];
+    sendWS(`${command}=${sl.value}`, true);
+  }, 50);
 }
 function handleWiFiData(fileData) {
   if (!fileData) return;
@@ -1086,10 +1915,55 @@ function applyTZ(){
   sendWS("sntp1="+getId("sntp1").value);
 }
 function rebootSystem(info){
+  // Заменяем содержимое страницы коротким сообщением и блокируем меню,
+  // чтобы пользователь не пытался кликнуть что-то в момент перезагрузки ESP.
   getId("settingscontent").innerHTML=`<h2>${info}</h2>`;
   getId("settingsdone").classList.add("hidden");
   getId("navigation").classList.add("hidden");
-  setTimeout(function(){ window.location.href=`http://${hostname}/`; }, 5000);
+  // Ждём готовности веб-сервера и автоматически переходим на корень — без ручного F5.
+  waitForWebReadyAndRedirect('/', 4000);
+}
+// Надёжное ожидание готовности веб-сервера после reboot.
+// Стоковая прошивка делает простой setTimeout 5 сек + redirect, потому что грузится быстро.
+// Модификация (DLNA, PSRAM-кэш, LittleFS, индексация SD, AsyncTCP) поднимается дольше,
+// поэтому короткого таймаута не хватает и пользователь видит "сайт недоступен" → F5.
+// Решение: после короткой паузы цикл XHR-проб к /variables.js (это самый лёгкий эндпоинт,
+// отдаётся sprintf-буфером, не читает LittleFS). Первый успешный ответ — мгновенный redirect.
+function waitForWebReadyAndRedirect(targetPath, startDelayMs){
+  var path = targetPath || '/';
+  // Стартовая пауза: пока ESP физически перезагружается, любые пробы заведомо неуспешны.
+  var startDelay = (typeof startDelayMs === 'number' && startDelayMs >= 0) ? startDelayMs : 0;
+  // Жёсткий дедлайн на цикл проб: 90 секунд (с большим запасом на медленный Wi‑Fi/инициализацию FS).
+  var deadlineMs = Date.now() + 90000;
+  // Эндпоинт-индикатор готовности (отдаёт несколько байт текста без обращения к LittleFS).
+  var probeUrl = `http://${hostname}/variables.js?_=` + Date.now();
+  function doRedirect(){
+    // Используем replace, чтобы reboot-сообщение не оставалось в истории браузера ("Назад").
+    window.location.replace(`http://${hostname}${path}`);
+  }
+  function probe(){
+    // Если прошлый exhange длинный — XHR с явным timeout надёжнее fetch на мобильных браузерах.
+    var xhr;
+    try{ xhr = new XMLHttpRequest(); }catch(e){ setTimeout(probe, 1200); return; }
+    xhr.timeout = 2500;
+    xhr.onload = function(){
+      // Любой 2xx подтверждает: webserver поднят и обрабатывает запросы — можно переходить.
+      if(xhr.status >= 200 && xhr.status < 300){ doRedirect(); return; }
+      if(Date.now() < deadlineMs){ setTimeout(probe, 1200); }
+      else doRedirect();
+    };
+    xhr.onerror = function(){
+      if(Date.now() < deadlineMs){ setTimeout(probe, 1200); }
+      else doRedirect();
+    };
+    xhr.ontimeout = xhr.onerror;
+    try{ xhr.open('GET', probeUrl, true); xhr.send(null); }
+    catch(e){
+      if(Date.now() < deadlineMs){ setTimeout(probe, 1200); }
+      else doRedirect();
+    }
+  }
+  setTimeout(probe, startDelay);
 }
 function submitWiFi(){
   var output="";
@@ -1115,7 +1989,9 @@ function submitWiFi(){
     getId("settingscontent").innerHTML="<h2>Settings saved. Rebooting...</h2>";
     getId("settingsdone").classList.add("hidden");
     getId("navigation").classList.add("hidden");
-    setTimeout(function(){ window.location.href=`http://${hostname}/`; }, 10000);
+    // После сохранения Wi‑Fi устройство перезагружается дольше обычного;
+    // используем тот же надёжный механизм ожидания готовности веба.
+    waitForWebReadyAndRedirect('/', 10000);
   }
 }
 function playItem(target){
@@ -1124,8 +2000,11 @@ function playItem(target){
   sendWS(`play=${item}`, true);
 }
 function hideSpinner(){
-  getId("progress").classList.add("hidden");
-  getId("content").classList.remove("hidden");
+  // Без null-check ранний вызов (до полной оболочки из netserver) ломал весь JS → «пустой экран до F5».
+  var pr = getId("progress");
+  if(pr) pr.classList.add("hidden");
+  var ct = getId("content");
+  if(ct) ct.classList.remove("hidden");
 }
 function changeMode(el){
   const cmd = el.dataset.command;
@@ -1205,6 +2084,29 @@ function setTrackFactsCache(title, facts) {
   };
 }
 
+/** Дисклеймер ИИ: по factsAi с прошивки; при отсутствии поля — эвристика tfprovider + префиксы iTunes:/Last.fm. */
+function trackFactsAiDisclaimerFromData(data) {
+  const tf = data && data.tfprovider != null ? data.tfprovider : null;
+  let fa = null;
+  if (data && data.factsAi !== undefined && data.factsAi !== null) {
+    fa = Number(data.factsAi) === 1;
+  }
+  const factsArr = (data && data.facts) || [];
+  if (typeof window.trackFactsAiDisclaimerHtml === 'function') {
+    return window.trackFactsAiDisclaimerHtml(tf, fa, factsArr);
+  }
+  for (let i = 0; i < factsArr.length; i++) {
+    const s = String(factsArr[i] || '').trim();
+    if (s.indexOf('iTunes:') === 0 || s.indexOf('Last.fm') === 0) return '';
+  }
+  const p = tf != null ? Number(tf) : 2;
+  if (fa === false) return '';
+  if (fa === true || p === 0 || p === 1 || p === 4) {
+    return '<p class="no-facts" style="opacity:0.72;font-size:0.85em;margin-top:0.5em">Текст сгенерирован ИИ; возможны неточности.</p>';
+  }
+  return '';
+}
+
 function closeFactsDialog() {
   // Централизованно закрываем диалог фактов и очищаем все его таймеры.
   // Это исключает дублирование кода и ситуации, когда один из таймеров остаётся активным.
@@ -1220,6 +2122,55 @@ function closeFactsDialog() {
   if (factsDialogPollTimer) {
     clearTimeout(factsDialogPollTimer);
     factsDialogPollTimer = null;
+  }
+}
+
+// Повторный тап по обложке/лого при открытом диалоге: следующий фрагмент AI-серии или закрытие окна.
+async function factsDialogSecondTap() {
+  if (!trackFactsEnabled) {
+    closeFactsDialog();
+    return;
+  }
+  if (isPlayerStoppedDom()) {
+    closeFactsDialog();
+    return;
+  }
+  try {
+    const response = await fetch('/api/current-fact?t=' + Date.now());
+    if (!response.ok) {
+      closeFactsDialog();
+      return;
+    }
+    const data = await response.json();
+    if (!trackFactsManualRequestAllowed(data.title)) {
+      closeFactsDialog();
+      return;
+    }
+    const incomplete =
+      Number(data.incompleteIterative) === 1 || data.incompleteIterative === true;
+    if (!incomplete) {
+      closeFactsDialog();
+      return;
+    }
+    sendWS('trackfactsrequest=1');
+    const content = getId('factsdialog-content');
+    if (content) {
+      const facts = (data.facts || []).filter(f => f && f.trim().length > 0);
+      const factsHtml = facts.map(f => '<p>💡 ' + escapeHtmlFacts(f) + '</p>').join('');
+      const aiNote = trackFactsAiDisclaimerFromData(data);
+      content.innerHTML =
+        factsHtml + aiNote + '<p class="no-facts" style="opacity:0.88">⏳ Загружаем остальные фрагменты…</p>';
+    }
+    if (factsDialogTimer) {
+      clearTimeout(factsDialogTimer);
+      factsDialogTimer = null;
+    }
+    factsDialogTimer = setTimeout(() => {
+      closeFactsDialog();
+    }, 30000);
+    pollFactsDialogUntilReady(90000);
+  } catch (e) {
+    closeFactsDialog();
   }
 }
 
@@ -1244,7 +2195,8 @@ function toggleFactsDialog() {
   }
   
   if (isVisible) {
-    closeFactsDialog();
+    factsDialogSecondTap();
+    return;
   } else {
     // Закрываем другие диалоги
     window.factsDialogOpen = true;
@@ -1270,60 +2222,113 @@ function toggleFactsDialog() {
 }
 
 async function pollFactsDialogUntilReady(maxMs) {
-  // Держим диалог "живым" после ручного запроса:
-  // регулярно перепрашиваем API, чтобы не оставлять вечное "⏳ Запрос факта...".
+  // Радио одно ядро занято звуком; ответ AI/сеть могут занять до ~1–2 мин при серии фактов.
+  const POLL_MS = 1500;
+  const HARD_CAP_MS = Math.max(maxMs || 0, 90000) + 60000;
   const startedAt = Date.now();
   const content = getId('factsdialog-content');
   const header = getId('factsdialog-header');
   if (!content) return;
 
-  // Локальная функция одного шага опроса.
   const tick = async () => {
-    // Если диалог уже закрыт — прекращаем опрос.
     if (!window.factsDialogOpen) {
       factsDialogPollTimer = null;
+      return;
+    }
+    if (isPlayerStoppedDom()) {
+      closeFactsDialog();
       return;
     }
 
     try {
       const response = await fetch('/api/current-fact?t=' + Date.now());
       if (!response.ok) {
-        content.innerHTML = '<p class="no-facts">Факты недоступны</p>';
+        content.innerHTML = '<p class="no-facts">Не удалось связаться с устройством</p>';
         factsDialogPollTimer = null;
         return;
       }
       const data = await response.json();
+      if (isPlayerStoppedDom()) {
+        closeFactsDialog();
+        return;
+      }
       const facts = (data.facts || []).filter(f => f && f.trim().length > 0);
+      const stillPending = Number(data.pending) === 1 || data.pending === true;
+      const manualMore = Number(data.manualMore) === 1 || data.manualMore === true;
+      const elapsed = Date.now() - startedAt;
       if (header && data.title) {
         header.innerHTML = '💡 ' + escapeHtmlFacts(data.title);
       }
 
-      // Если факт уже получен — показываем и завершаем опрос.
       if (facts.length > 0) {
         setTrackFactsCache(data.title || '', facts);
-        content.innerHTML = facts.map(f => '<p>💡 ' + escapeHtmlFacts(f) + '</p>').join('');
+        const factsHtml = facts.map(f => '<p>💡 ' + escapeHtmlFacts(f) + '</p>').join('');
+        const aiNote = trackFactsAiDisclaimerFromData(data);
+        if (!stillPending) {
+          const incompletePoll =
+            !isPlayerStoppedDom() &&
+            (Number(data.incompleteIterative) === 1 || data.incompleteIterative === true);
+          const hintPoll = incompletePoll
+            ? '<p class="no-facts" style="opacity:0.85;font-size:0.9em">Нажмите на обложку или лого ещё раз — следующий фрагмент.</p>'
+            : '';
+          content.innerHTML = factsHtml + aiNote + hintPoll;
+          factsDialogPollTimer = null;
+          return;
+        }
+        if (elapsed < HARD_CAP_MS) {
+          const incomplete =
+            Number(data.incompleteIterative) === 1 || data.incompleteIterative === true;
+          const showLoadingMore =
+            stillPending && (manualMore || incomplete);
+          const tail = showLoadingMore
+            ? '<p class="no-facts" style="opacity:0.88">⏳ Загружаем остальные фрагменты…</p>'
+            : '';
+          content.innerHTML = factsHtml + aiNote + tail;
+          factsDialogPollTimer = setTimeout(tick, POLL_MS);
+          return;
+        }
+        content.innerHTML = factsHtml + aiNote;
         factsDialogPollTimer = null;
         return;
       }
 
-      // Если запрос ещё в процессе и мы не вышли по таймауту — продолжаем polling.
-      const elapsed = Date.now() - startedAt;
-      if (data.pending && elapsed < maxMs) {
-        const leftSec = Math.max(1, Math.ceil((maxMs - elapsed) / 1000));
-        content.innerHTML = '<p class="no-facts">⏳ Запрос факта... (' + leftSec + 'с)</p>';
-        factsDialogPollTimer = setTimeout(tick, 1000);
+      const cached = window.trackFactsCache || { title: '', facts: [] };
+      const cachedFacts = (cached.facts || []).filter(f => f && f.trim().length > 0);
+      if (!stillPending && cachedFacts.length > 0 && data.title && cached.title === data.title) {
+        const aiNoteC = trackFactsAiDisclaimerFromData(data);
+        content.innerHTML = cachedFacts.map(f => '<p>💡 ' + escapeHtmlFacts(f) + '</p>').join('') + aiNoteC;
+        factsDialogPollTimer = null;
         return;
       }
 
-      // Если pending снят или вышли по времени — показываем причину/финальный статус.
+      if (stillPending) {
+        if (elapsed < HARD_CAP_MS) {
+          const leftSec = Math.max(1, Math.ceil((HARD_CAP_MS - elapsed) / 1000));
+          content.innerHTML =
+            '<p class="no-facts">⏳ Готовим текст о треке… Обычно до 30–60 с. Окно можно закрыть — результат появится под обложкой.</p>' +
+            '<p class="no-facts" style="opacity:0.75;font-size:0.9em">Осталось до тайм-аута: ~' + leftSec + ' с</p>';
+          factsDialogPollTimer = setTimeout(tick, POLL_MS);
+          return;
+        }
+        content.innerHTML =
+          '<p class="no-facts">За отведённое время ответ не успел прийти. Проверьте интернет и нажмите на обложку ещё раз.</p>';
+        factsDialogPollTimer = null;
+        return;
+      }
+
+      if (!trackFactsManualRequestAllowed(data.title)) {
+        closeFactsDialogAndNotifyTrackFactsBlocked(data.title);
+        return;
+      }
       if (data.status && data.status.length > 0) {
         content.innerHTML = '<p class="no-facts">' + escapeHtmlFacts(data.status) + '</p>';
       } else {
-        content.innerHTML = '<p class="no-facts">Запрос факта не выполнен. Попробуйте позже.</p>';
+        content.innerHTML =
+          '<p class="no-facts">Текста о треке пока нет. Нажмите на обложку ещё раз через несколько секунд или смените композицию.</p>';
       }
       factsDialogPollTimer = null;
     } catch (e) {
-      content.innerHTML = '<p class="no-facts">Ошибка загрузки фактов</p>';
+      content.innerHTML = '<p class="no-facts">Ошибка загрузки. Повторите попытку.</p>';
       factsDialogPollTimer = null;
     }
   };
@@ -1359,8 +2364,14 @@ async function loadFactsForDialog() {
     if (facts.length === 0) {
       // [FIX] Cache-first: если API временно отдал пусто, но в локальном кеше есть факты
       // для того же трека — показываем их сразу и не отправляем ручной сетевой запрос.
-      if (cachedFacts.length > 0 && cached.title && data.title && cached.title === data.title) {
-        content.innerHTML = cachedFacts.map(f => '<p>💡 ' + escapeHtmlFacts(f) + '</p>').join('');
+      if (cachedFacts.length > 0 && cached.title && data.title && cached.title === data.title &&
+          trackFactsManualRequestAllowed(data.title)) {
+        const aiNoteC = trackFactsAiDisclaimerFromData(data);
+        content.innerHTML = cachedFacts.map(f => '<p>💡 ' + escapeHtmlFacts(f) + '</p>').join('') + aiNoteC;
+        return;
+      }
+      if (!trackFactsManualRequestAllowed(data.title)) {
+        closeFactsDialogAndNotifyTrackFactsBlocked(data.title);
         return;
       }
       // [FIX] Если есть служебный статус — показываем его, без подмены факта
@@ -1373,13 +2384,25 @@ async function loadFactsForDialog() {
       content.innerHTML = '<p class="no-facts">⏳ Запрос факта...</p>';
       // После ручного запроса не оставляем "вечное ожидание":
       // опрашиваем API до готовности факта/ошибки с ограничением по времени.
-      pollFactsDialogUntilReady(15000);
+      pollFactsDialogUntilReady(90000);
       return;
     }
     
     // Если факты пришли от API — сразу обновляем глобальный кеш.
     setTrackFactsCache(data.title || '', facts);
-    content.innerHTML = facts.map(f => '<p>💡 ' + escapeHtmlFacts(f) + '</p>').join('');
+    const incompleteHint =
+      !isPlayerStoppedDom() &&
+      (Number(data.incompleteIterative) === 1 || data.incompleteIterative === true);
+    const hintHtml = incompleteHint
+      ? '<p class="no-facts" style="opacity:0.85;font-size:0.9em">Нажмите на обложку или лого ещё раз — следующий фрагмент.</p>'
+      : '';
+    const aiNoteOpen = trackFactsAiDisclaimerFromData(data);
+    content.innerHTML =
+      facts.map(f => '<p>💡 ' + escapeHtmlFacts(f) + '</p>').join('') + aiNoteOpen + hintHtml;
+    const stillPendingOpen = Number(data.pending) === 1 || data.pending === true;
+    if (stillPendingOpen) {
+      pollFactsDialogUntilReady(90000);
+    }
   } catch (e) {
     content.innerHTML = '<p class="no-facts">Ошибка загрузки фактов</p>';
   }
@@ -1391,7 +2414,58 @@ function escapeHtmlFacts(text) {
   return div.innerHTML;
 }
 
-// Функция рендера версии в футере WebUI.
+function isPlayerStoppedDom() {
+  const w = getId('playerwrap');
+  return !!(w && w.classList.contains('stopped'));
+}
+
+/**
+ * Строка под названием станции (#meta) обновляется по WS быстрее, чем «остывает» metaTitle в /api/current-fact.
+ * Без этой проверки API может ещё отдавать старый ICY-трек, а в UI уже [остановлено] — и показывался лишний диалог.
+ */
+function trackFactsUiLineIsStoppedOrSystem() {
+  const m = getId('meta');
+  if (!m) return false;
+  const raw = String(m.textContent || m.innerText || '').trim();
+  if (!raw) return false;
+  if (/\[(остановлено|stopped)\]/i.test(raw)) return true;
+  const first = raw.split(/\n/)[0].trim();
+  return isSystemMetaValue(first);
+}
+
+let _tfManualBlockedToastAt = 0;
+function notifyTrackFactsManualBlocked(apiTitle) {
+  const now = Date.now();
+  if (now - _tfManualBlockedToastAt < 2200) return;
+  _tfManualBlockedToastAt = now;
+  if (typeof window.showToast !== 'function') return;
+  const t = (apiTitle != null && apiTitle !== undefined) ? String(apiTitle).trim() : '';
+  const playbackBlocked =
+    isPlayerStoppedDom() ||
+    trackFactsUiLineIsStoppedOrSystem() ||
+    /\[(остановлено|stopped)\]/i.test(t);
+  window.showToast(
+    playbackBlocked
+      ? 'Запрос факта доступен только во время воспроизведения.'
+      : 'Сейчас в строке трека нет названия композиции для запроса факта.',
+    true
+  );
+}
+
+function closeFactsDialogAndNotifyTrackFactsBlocked(apiTitle) {
+  notifyTrackFactsManualBlocked(apiTitle);
+  closeFactsDialog();
+}
+
+/** Ручной сетевой запрос факта по обложке — только при воспроизведении и когда title не служебный статус. */
+function trackFactsManualRequestAllowed(apiTitle) {
+  if (isPlayerStoppedDom()) return false;
+  if (trackFactsUiLineIsStoppedOrSystem()) return false;
+  const t = (apiTitle != null && apiTitle !== undefined) ? String(apiTitle).trim() : '';
+  if (t.length > 0 && isSystemMetaValue(t)) return false;
+  return true;
+}
+
 
 function renderVersionLink() {
   // Получаем элемент футера, куда выводится версия.
@@ -1447,10 +2521,15 @@ function continueLoading(mode){
         if (typeof window.rebindCoverArtObservers === 'function') window.rebindCoverArtObservers();
         // Показываем UI сразу после разметки; logo.svg может подгружаться с задержкой — раньше из‑за этого висел спиннер.
         hideSpinner();
+        initDlnaPlayerUi();
         audiopreview=getId('audiopreview');
         initClock();
         setTimeout(() => {
-          document.addEventListener('click', function(e) {
+          // Один раз на сессию: иначе при каждом повторном fetch player.html навешивались новые слушатели
+          // и поведение (в т.ч. закрытие окон) становилось непредсказуемым.
+          if(!window.__lstepPlayerOutsideUiBound){
+            window.__lstepPlayerOutsideUiBound = true;
+            document.addEventListener('click', function(e) {
             const dialog = getId('genredialog');
             const genreBtn = getId('genrebutton');
             
@@ -1459,6 +2538,16 @@ function continueLoading(mode){
                 !genreBtn.contains(e.target)) {
               dialog.style.display = 'none';
               genreBtn.classList.remove('active');
+            }
+            const equalizer = getId('equalizerbg');
+            const eqBtn = getId('eqalbutton');
+            if (equalizer && !equalizer.classList.contains('hidden') &&
+                !equalizer.contains(e.target) &&
+                (!eqBtn || !eqBtn.contains(e.target))) {
+              // Клик вне окна эквалайзера закрывает его и вложенную DLNA-панель.
+              equalizer.classList.add('hidden');
+              if (eqBtn) eqBtn.classList.remove('active');
+              syncDlnaPanelUnderEqualizer();
             }
             
             const factsDialog = getId('factsdialog');
@@ -1470,7 +2559,8 @@ function continueLoading(mode){
                 (!coverEl || !coverEl.contains(e.target))) {
               closeFactsDialog();
             }
-          });
+            });
+          }
           
           const logoEl = getId('logo');
           const coverEl = getId('cover-art-display');
@@ -1493,9 +2583,17 @@ function continueLoading(mode){
      
         renderVersionLink();
         document.querySelectorAll('input[type="range"]').forEach(sl => { fillSlider(sl); });
-        sendWS('getindex=1');
-        sendWS('gettrackfacts=1'); // [FIX] Запрашиваем состояние TrackFacts для player page
-      }).catch(function(){ hideSpinner(); });
+        // Критичные запросы состояния отправляем immediate,
+        // чтобы интерфейс быстрее выходил в консистентное состояние после загрузки страницы.
+        sendWS('getindex=1', true);
+        sendWS('gettrackfacts=1', true); // [FIX] Запрашиваем состояние TrackFacts для player page
+        // Синхронизация webcpu и прочих системных флагов (полоска CPU внизу включается по полю webcpu).
+        sendWS('getsystem=1', true);
+      }).catch(function(){
+        // Стоковая ветка: при ошибке сети просто снимаем спиннер. Повторная сборка shell
+        // произойдёт автоматически при следующем onOpen WS (например, после reboot).
+        hideSpinner();
+      });
     }
     if(pathname=='/settings.html'){
       document.title = `${yoTitle} - Settings`;
@@ -1508,12 +2606,7 @@ function continueLoading(mode){
         }).catch(function(){});
         renderVersionLink();
         document.querySelectorAll('input[type="range"]').forEach(sl => { fillSlider(sl); });
-        sendWS('getsystem=1');
-        sendWS('getscreen=1');
-        sendWS('gettimezone=1');
-        sendWS('getweather=1');
-        sendWS('getcontrols=1');
-        sendWS('gettrackfacts=1');
+        bootstrapSettingsPageWsQueries();
         // Навешиваем обработчик смены провайдера для обновления описания ключа
         setTimeout(() => {
           let sel = getId('tfprovider');
@@ -1523,14 +2616,13 @@ function continueLoading(mode){
           }
         }, 100);
         getWiFi(`http://${hostname}/data/wifi.csv`+"?"+new Date().getTime());
-        sendWS('getactive=1');
-        settingsActReceived = false;
-        settingsActRetryCount = 0;
-        scheduleSettingsActRetry();
         classEach("reset", function(el){ el.innerHTML='<svg viewBox="0 0 16 16" class="fill"><path d="M8 3v5a36.973 36.973 0 0 1-2.324-1.166A44.09 44.09 0 0 1 3.417 5.5a52.149 52.149 0 0 1 2.26-1.32A43.18 43.18 0 0 1 8 3z"/><path d="M7 5v1h4.5C12.894 6 14 7.106 14 8.5S12.894 11 11.5 11H1v1h10.5c1.93 0 3.5-1.57 3.5-3.5S13.43 5 11.5 5h-4z"/></svg>'; });
         // Загружаем информацию о файловой системе в TOOLS
         loadFsInfo();
-      }).catch(function(){ hideSpinner(); });
+      }).catch(function(){
+        // Сток: при ошибке сети просто снимаем спиннер. Повтор инициирует следующий onOpen WS.
+        hideSpinner();
+      });
     }
     if(pathname=='/update.html'){
       document.title = `${yoTitle} - Update`;
@@ -1544,7 +2636,10 @@ function continueLoading(mode){
         }).catch(function(){});
 
         renderVersionLink();
-      }).catch(function(){ hideSpinner(); });
+      }).catch(function(){
+        // Сток: при ошибке сети просто снимаем спиннер. Повтор инициирует следующий onOpen WS.
+        hideSpinner();
+      });
     }
     if(pathname=='/ir.html'){
       document.title = `${yoTitle} - IR Recorder`;
@@ -1561,7 +2656,10 @@ function continueLoading(mode){
         });
 
         renderVersionLink();
-      }).catch(function(){ hideSpinner(); });
+      }).catch(function(){
+        // Сток: при ошибке сети просто снимаем спиннер. Повтор инициирует следующий onOpen WS.
+        hideSpinner();
+      });
     }
   }else{ // AP mode
     fetchShellHtml(`options.html?${yoVersion}`).then(options => {
@@ -1574,13 +2672,16 @@ function continueLoading(mode){
 
       renderVersionLink();
       getWiFi(`http://${hostname}/data/wifi.csv`+"?"+new Date().getTime());
-      sendWS('getactive=1');
       if(window.location.pathname=='/settings.html'){
-        settingsActReceived = false;
-        settingsActRetryCount = 0;
-        scheduleSettingsActRetry();
+        bootstrapSettingsPageWsQueries();
+      }else{
+        sendWS('getactive=1', true);
       }
-    }).catch(function(){ hideSpinner(); });
+    }).catch(function(){
+      // Сток (AP-ветка): при ошибке сети просто снимаем спиннер.
+      // Повтор сборки shell инициирует следующий onOpen WS.
+      hideSpinner();
+    });
   }
   if(clickUiAttached) return;
   clickUiAttached = true;
@@ -1656,6 +2757,43 @@ function continueLoading(mode){
         /* Поиск по плейлисту */
         case "searchplaylist": toggleSearchDialog(); break;
         case "searchclose": closeSearchDialog(); break;
+
+        case "dlna_init":
+          fetch(`http://${hostname}/dlna/init`).then(function(r){ return r.json(); }).then(function(j){
+            dlnaToast((j.ok || j.queued) ? 'DLNA: init в очереди worker' : 'DLNA: очередь worker занята', !(j.ok || j.queued));
+          }).catch(function(){ dlnaToast('DLNA init: ошибка сети', true); });
+          break;
+        case "dlna_status":
+          fetch(`http://${hostname}/dlna/status`).then(function(r){ return r.json(); }).then(function(j){
+            var err = (j.error != null && String(j.error).length) ? (' | ' + j.error) : '';
+            dlnaToast('DLNA: busy=' + j.busy + ' jobs=' + j.processed + err, false);
+          }).catch(function(){ dlnaToast('DLNA status: ошибка сети', true); });
+          break;
+        case "dlna_refresh":
+          dlnaRefreshContainerList();
+          break;
+        case "dlna_build":
+          fetch(`http://${hostname}/dlna/build?objectId=${encodeURIComponent(dlnaObjectIdParam())}&limit=${dlnaParseLimit()}`).then(function(r){ return r.json(); }).then(function(j){
+            dlnaToast(j.queued ? 'DLNA: build в очереди' : 'DLNA: build не поставлен', !j.queued);
+          }).catch(function(){ dlnaToast('DLNA build: ошибка сети', true); });
+          break;
+        case "dlna_append":
+          fetch(`http://${hostname}/dlna/append?objectId=${encodeURIComponent(dlnaObjectIdParam())}&limit=${dlnaParseLimit()}`).then(function(r){ return r.json(); }).then(function(j){
+            dlnaToast(j.queued ? 'DLNA: append в очереди' : 'DLNA: append не поставлен', !j.queued);
+          }).catch(function(){ dlnaToast('DLNA append: ошибка сети', true); });
+          break;
+        case "dlna_use_web":
+          fetch(`http://${hostname}/playlist/web`).then(function(){
+            dlnaToast('Источник плейлиста: WEB', false);
+            dlnaAfterSourceSwitch();
+          }).catch(function(){ dlnaToast('playlist/web: ошибка сети', true); });
+          break;
+        case "dlna_use_dlna":
+          fetch(`http://${hostname}/playlist/dlna`).then(function(){
+            dlnaToast('Источник плейлиста: DLNA', false);
+            dlnaAfterSourceSwitch();
+          }).catch(function(){ dlnaToast('playlist/dlna: ошибка сети', true); });
+          break;
           
         default: break;
       }
@@ -1747,7 +2885,10 @@ function rebootingProgress(){
   getId("updateprogress").value = Math.round(tickcount/7);
   tickcount+=14;
   if(tickcount>700){
-    location.href=`http://${hostname}/`;
+    // После OTA "слепой" redirect часто попадает в окно, когда ESP ещё не поднял HTTP.
+    // Из-за этого пользователь видел страницу ошибки и жал F5 вручную.
+    // Переходим только после подтверждения готовности web-сервера.
+    waitForWebReadyAndRedirect('/', 0);
   }else{
     setTimeout(rebootingProgress, 200);
   }
@@ -1785,8 +2926,8 @@ function updateKeyDesc(send = true){
   // Отправляем команду на радио только если это ручное изменение (не инициализация по websocket)
   if (send) sendWS(`trackfactsprovider=${val}`);
 
-  // Провайдеры: Gemini=0, DeepSeek=1, iTunes=2, LastFM=3, MusicBrainz=4
-  if (val == 2 || val == 4) { 
+  // Провайдеры: Gemini=0, DeepSeek=1, iTunes=2, LastFM=3, Groq=4
+  if (val == 2) {
     row.classList.add("hidden");
   } else {
     row.classList.remove("hidden");
@@ -1801,6 +2942,10 @@ function updateKeyDesc(send = true){
     if (val == 3) {
       span.innerHTML = 'last.fm api key [<a href="https://www.last.fm/api/account/create" target="_blank">get key</a>]';
       k.placeholder = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+    }
+    if (val == 4) {
+      span.innerHTML = 'groq api key [<a href="https://console.groq.com/keys" target="_blank">get free key</a>]';
+      k.placeholder = "gsk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
     }
   }
 }
@@ -2041,120 +3186,7 @@ function initClock() {
   setInterval(update, 1000);
 }
 
-// ============================================================================
-// [v0.4.4] TrackFacts - модуль для отображения фактов о композициях
-// ============================================================================
-(function() {
-    'use strict';
-    const CONFIG = {
-        API_ENDPOINT: '/api/current-fact',
-        FACT_SHOW_TIME: 15000,
-        PAUSE_TIME: 15000,
-        CHECK_INTERVAL: 4000,
-        FETCH_DELAY: 2000
-    };
-    let lastTitle = '';
-    let lastRawFacts = '';
-    let currentFacts = [];
-    let currentFactIndex = 0;
-    let isShowingFact = false;
-    let cycleTimer = null;
-    function isPlayerPlaying() {
-        const playerwrap = document.getElementById('playerwrap');
-        return playerwrap && playerwrap.classList.contains('playing');
-    }
-    function getMetaElement() { return document.getElementById('meta'); }
-    function resetAll() {
-        if (cycleTimer) { clearTimeout(cycleTimer); cycleTimer = null; }
-        isShowingFact = false;
-        currentFacts = [];
-        currentFactIndex = 0;
-        lastRawFacts = '';
-        // [FIX] При полном сбросе очищаем и общий кеш диалога, чтобы не показывать устаревшие данные.
-        setTrackFactsCache('', []);
-        const meta = getMetaElement();
-        if (meta) {
-            meta.classList.remove('track-fact');
-            meta.style.fontSize = ''; meta.style.color = ''; meta.style.fontStyle = ''; meta.style.lineHeight = '';
-            if (lastTitle) meta.textContent = lastTitle;
-        }
-    }
-    window.resetTrackFacts = function() { lastTitle = ''; resetAll(); };
-    function displayNext() {
-        const meta = getMetaElement();
-        if (!meta || !isPlayerPlaying()) { resetAll(); return; }
-        // [FIX] Когда диалог фактов открыт, показываем трек вместо факта
-        if (window.factsDialogOpen) {
-            meta.classList.remove('track-fact');
-            meta.style.fontSize = ''; meta.style.color = ''; meta.style.fontStyle = ''; meta.style.lineHeight = '';
-            if (lastTitle) meta.textContent = lastTitle;
-            cycleTimer = setTimeout(displayNext, 2000);
-            return;
-        }
-        if (!isShowingFact && currentFacts.length > 0) {
-            const fact = currentFacts[currentFactIndex];
-            if (!fact || fact.trim().length === 0) {
-                currentFactIndex = (currentFactIndex + 1) % currentFacts.length;
-                cycleTimer = setTimeout(displayNext, 1000);
-                return;
-            }
-            meta.classList.add('track-fact');
-            meta.style.fontSize = '1.2em'; meta.style.fontStyle = 'italic'; meta.style.lineHeight = '1.4';
-            meta.textContent = '💡 ' + fact;
-            isShowingFact = true;
-            currentFactIndex = (currentFactIndex + 1) % currentFacts.length;
-            cycleTimer = setTimeout(displayNext, CONFIG.FACT_SHOW_TIME);
-        } else {
-            meta.classList.remove('track-fact');
-            meta.style.fontSize = ''; meta.style.color = ''; meta.style.fontStyle = ''; meta.style.lineHeight = '';
-            meta.textContent = lastTitle;
-            isShowingFact = false;
-            cycleTimer = setTimeout(displayNext, CONFIG.PAUSE_TIME);
-        }
-    }
-    async function checkAndDisplayFact() {
-        if (!isPlayerPlaying()) { resetAll(); return; }
-        try {
-            const response = await fetch(CONFIG.API_ENDPOINT + '?t=' + Date.now());
-            if (!response.ok) return;
-            const data = await response.json();
-            if (!data || !data.title) return;
-            if (data.title !== lastTitle) {
-                lastTitle = data.title;
-                resetAll();
-                const facts = (data.facts || []).filter(function(f) { return f && f.trim().length > 0; });
-                lastRawFacts = facts.join('###');
-                if (facts.length > 0) {
-                    currentFacts = facts;
-                    // [FIX] Синхронизируем глобальный кеш сразу после получения фактов от API.
-                    setTrackFactsCache(data.title || '', facts);
-                    currentFactIndex = 0;
-                    cycleTimer = setTimeout(displayNext, CONFIG.FETCH_DELAY);
-                }
-            } else {
-                const facts = (data.facts || []).filter(function(f) { return f && f.trim().length > 0; });
-                const newRawFacts = facts.join('###');
-                if (newRawFacts !== lastRawFacts && newRawFacts.length > 0) {
-                    lastRawFacts = newRawFacts;
-                    currentFacts = facts;
-                    // [FIX] Обновляем глобальный кеш при изменении списка фактов на том же треке.
-                    setTrackFactsCache(data.title || '', facts);
-                    if (!cycleTimer && !isShowingFact) displayNext();
-                }
-                if (facts.length === 0 && !data.pending) resetAll();
-            }
-            const meta = getMetaElement();
-            if (meta && !isShowingFact && currentFacts.length === 0 && data.pending) {
-                meta.textContent = lastTitle + ' ⏳';
-            }
-        } catch (error) { console.error('[TrackFacts] Error:', error); }
-    }
-    function init() {
-        setInterval(checkAndDisplayFact, CONFIG.CHECK_INTERVAL);
-        checkAndDisplayFact();
-    }
-    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
-})();
+// TrackFacts: только facts.js (подключается выше), без второго setInterval — иначе двойной poll /api/current-fact.
 
 // Обложки: только cover.js (подключается выше), без дубликата — иначе двойной poll и «мёртвый» observer.
 
@@ -2177,7 +3209,7 @@ function initClock() {
             for(let i = 0; i < list.length; i += 1) if(list[i] === target.parentNode) indexDrop = i;
             if(index > indexDrop) target.parentNode.before( dragged ); else target.parentNode.after( dragged );
             let items=document.getElementById('pleditorcontent').getElementsByTagName('li');
-            for (let i = 0; i <= items.length-1; i++) items[i].getElementsByTagName('span')[0].innerText=("00"+(i+1)).slice(-3);
+            for (let i = 0; i <= items.length-1; i++) items[i].getElementsByTagName('span')[0].innerText=String(i+1).padStart(3, '0');
         }
     });
 })();

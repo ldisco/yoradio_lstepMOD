@@ -1,6 +1,6 @@
 // TrackFacts.h - Плагин для отображения интересных фактов о песнях
-// v0.4.1 - iTunes по умолчанию (позиция 2), MusicBrainz перенесён на позицию 4
-// Ограничение повторных запросов для метаданных-провайдеров. Max 3 факта.
+// v0.4.1 - iTunes по умолчанию (2); слот 4 — Groq (ранее MusicBrainz)
+// Потолок итераций — TRACKFACTS_MAX_PER_TRACK; сохранённый лимит — TRACKFACTS_CONFIG_COUNT_MAX (myoptions.h).
 #ifndef TrackFacts_H
 #define TrackFacts_H
 
@@ -15,13 +15,12 @@
 #include "providers/FactProvider.h"
 
 // Источники данных для получения фактов
-// [v0.4.1] iTunes и MusicBrainz поменяны местами: iTunes — по умолчанию (2)
 enum class FactSource {
   GEMINI = 0,       // Google Gemini Flash (бесплатный уровень)
   DEEPSEEK = 1,     // DeepSeek AI
-  ITUNES = 2,       // [v0.4.1] iTunes Search API (бесплатно, по умолчанию)
+  ITUNES = 2,       // iTunes Search API (бесплатно, по умолчанию)
   LASTFM = 3,       // База Last.fm (нужен ключ)
-  MUSICBRAINZ = 4,  // [v0.4.1] MusicBrainz (без ключа, через VPS relay)
+  GROQ = 4,         // Groq LLM (нужен ключ; значение 4 совместимо с сохранённым trackFactsProvider)
   CUSTOM = 5
 };
 
@@ -49,6 +48,8 @@ public:
   void setEnabled(bool enabled);
   bool requestManualFact(String* rejectReason = nullptr); // Ручной запрос факта из WebUI (true = запрос поставлен в очередь)
   bool isRequestPending() const { return manualRequestPending || isRequestInProgress; }
+  /** true — для текущего трека ещё ожидаются доп. факты (серия N>1 у Gemini/DeepSeek/Groq); для /api/current-fact и WebUI. */
+  bool isMultiFactGatherOngoing();
   
   // [v0.4.2] Система уведомлений (Toast)
   // Отправляет статусное сообщение в WebUI через WebSocket
@@ -59,6 +60,17 @@ public:
   FactLanguage getLanguage() const { return currentLanguage; }
   uint8_t getFactsCount() const { return factsPerTrack; }
   bool isRequestActive() const { return isRequestInProgress; }  // [FIX] Для changeMode() — ждём завершения SSL
+  /** Строка «исполнитель — трек» без рекламных хвостов (*** www.…) для /api/current-fact и диалога. */
+  String currentFactTrackLabelForApi() const;
+  /** Ручной запрос «ещё фрагмент» при уже показанных фактах — для подписи «дозагружаем…» только в этом случае. */
+  bool manualMoreFragmentsUi() const;
+  /**
+   * Для WebUI: AI-серия (facts per track > 1) не завершена, в RAM уже есть факты, можно запросить следующий тапом.
+   * Не true при пустом списке (первый фрагмент — ветка «пустой ответ») и не во время уже идущего запроса.
+   */
+  bool incompleteIterativeSeriesForApi() const;
+  /** Для /api/current-fact: дисклеймер «текст от ИИ» в WebUI только при реальном ответе LLM (не iTunes/Last.fm и не запасной iTunes). */
+  bool factsContentFromAi() const { return _displayFactsAreAi; }
 
 private:
   String lastTitle;       // Оригинальный заголовок для отслеживания смены трека
@@ -80,6 +92,11 @@ private:
       TrackFacts* instance;
       /** Снимок _factsSslEpoch на момент fetchFact; при смене станции/трека эпоха растёт — результат отбрасываем. */
       uint32_t sslEpoch;
+      /** Для итеративных AI: номер запроса 1..N и краткий список уже выданных фактов. */
+      uint8_t factIndex1;
+      uint8_t factTotal;
+      String priorFactsBrief;
+      bool isManual;
   };
   static void fetchTask(void* parameter);
 
@@ -97,23 +114,32 @@ private:
   uint32_t manualStableSinceMs;     // С какого времени поток считается непрерывно стабильным для low-buffer manual retry
   /** Установлен в on_ticker перед fetchFact: true = ручной запрос (не подменять AI→iTunes на FLAC). */
   bool _pendingFetchIsManual;
+  /** Пользователь запросил следующий фрагмент, когда в RAM уже есть хотя бы один факт. */
+  bool _manualMoreFragmentsUi;
   /** Увеличивается при смене станции/трека; не сбрасывать isRequestInProgress там — иначе CoverDL параллелит TLS с FactsTask → -32512. */
   uint32_t _factsSslEpoch;
+  bool _displayFactsAreAi;
 
   // === Failover (Отказоустойчивость) ===
   // Если пользователь выбрал провайдера, требующего ключ, но ключ не задан,
-  // система автоматически переключается на MusicBrainz и уведомляет пользователя.
-  bool _failoverActive;               // Флаг: работает ли failover (переключено на MusicBrainz)
+  // система переключается на iTunes и уведомляет пользователя.
+  bool _failoverActive;               // Флаг: работает ли failover (переключено на iTunes)
   bool _failoverNotified;             // Флаг: уведомление уже показано пользователю (показываем 1 раз)
   uint32_t _suppressFailoverToastUntilMs; // Не показывать тост «нет ключа» до этого времени (ввод ключа в настройках)
   void checkFailover();               // Проверка необходимости failover перед каждым запросом
 
   // [v0.4.1] Массив провайдеров — создаются в конструкторе, индексированы по FactSource
-  FactProvider* _providers[6];         // Gemini=0, DeepSeek=1, iTunes=2, LastFM=3, MusicBrainz=4, Custom=5
+  FactProvider* _providers[6];         // Gemini=0, DeepSeek=1, iTunes=2, LastFM=3, Groq=4, Custom=5
   FactProvider* getProvider(FactSource src); // Получить провайдер по FactSource
   void syncProviderSettings();         // Синхронизировать API ключ и язык со всеми провайдерами
 
   uint32_t lastStatusMs;               // Время последней отправки статуса (анти-спам)
+  /** Один toast за трек: факт фактически пришёл с iTunes после сбоя AI. */
+  bool _notifiedItunesAiFallback;
+  /** Один toast за трек: авто-запрос на FLAC принудительно через iTunes. */
+  bool _notifiedFlacItunesAuto;
+  /** Один toast за трек: «факт не получен» — только диалог, не строка currentFact/meta. */
+  bool _notifiedFactExhaustedToast;
 
   // === Файловый кэш (File-based Cache) ===
   // Каждый трек хранится в отдельном .txt файле в папке /data/facts/

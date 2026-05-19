@@ -28,15 +28,10 @@
 #include "vorbis_decoder/vorbis_decoder.h"
 #include "psram_unique_ptr.hpp"
 
-// Опционально: LOCK_TCPIP_CORE() вокруг connect() (см. ниже #if) — только если снова поймаете
-// редкий lwIP assert "Required to lock TCPIP core". По умолчанию выкл.: как в оригинале — прямой connect.
-//#define AUDIO_SAFE_TCPIP_CONNECT
-#if defined(AUDIO_SAFE_TCPIP_CONNECT)
-extern "C" {
-#include "lwip/opt.h"
-#include "lwip/tcpip.h"
-}
-#endif
+// lstepMOD: откат экспериментов с TCPIP lock / esp_netif_tcpip_exec вокруг connect — оставляем как в апстрим Audio
+// (прямой m_client->connect), чтобы не блокировать lwIP и не ломать веб. Редкий assert udp_new_ip_type на IDF 5.x
+// возможен при гонке DNS из playerTask; 
+// #define AUDIO_SAFE_TCPIP_CONNECT
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -731,13 +726,7 @@ bool Audio::connecttohost(const char* host, const char* user, const char* pwd) {
 
     AUDIO_INFO("connect to: \"%s\" on port %d path \"/%s\"", hwoe.get(), port, path.get());
 
-#if defined(AUDIO_SAFE_TCPIP_CONNECT)
-    LOCK_TCPIP_CORE();
     res = m_client->connect(hwoe.get(), port);
-    UNLOCK_TCPIP_CORE();
-#else
-    res = m_client->connect(hwoe.get(), port);
-#endif
 
     m_expectedCodec = CODEC_NONE;
     m_expectedPlsFmt = FORMAT_NONE;
@@ -857,7 +846,8 @@ bool Audio::httpPrint(const char* host) {
          else        { m_client = static_cast<NetworkClient*>(&client); }
         if(f_equal) AUDIO_INFO("The host has disconnected, reconnecting");
 
-        if(!m_client->connect(hwoe.get(), port)) {
+        bool okConn = m_client->connect(hwoe.get(), port);
+        if(!okConn) {
             AUDIO_ERROR("connection lost %s", c_host.c_get());
             stopSong();
             return false;
@@ -958,7 +948,8 @@ bool Audio::httpRange(uint32_t seek, uint32_t length){
     if(m_f_ssl) { m_client = static_cast<NetworkClientSecure*>(&clientsecure); if(m_f_ssl && port == 80) port = 443;}
     else        { m_client = static_cast<NetworkClient*>(&client); }
 
-    if(!m_client->connect(hwoe.get(), port)) {
+    bool okRange = m_client->connect(hwoe.get(), port);
+    if(!okRange) {
         AUDIO_ERROR("connection lost %s", c_host.c_get());
         stopSong();
         return false;
@@ -1050,7 +1041,8 @@ bool Audio::connecttospeech(const char* speech, const char* lang) {
 
     m_client = static_cast<NetworkClient*>(&client);
     AUDIO_INFO("connect to \"%s\"", host);
-    if(!m_client->connect(host, 80)) {
+    bool okSpeech = m_client->connect(host, 80);
+    if(!okSpeech) {
         AUDIO_ERROR("Connection failed");
         xSemaphoreGiveRecursive(mutex_playAudioData);
         return false;

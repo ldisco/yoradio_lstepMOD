@@ -23,9 +23,15 @@
 
 #define PLAYLIST_SD_PATH     "/data/playlistsd.csv"
 #define INDEX_SD_PATH        "/data/indexsd.dat"
+#define PLAYLIST_DLNA_PATH   "/data/playlist_dlna.csv"
+#define INDEX_DLNA_PATH      "/data/indexdlna.dat"
 
-#define REAL_PLAYL   config.getMode()==PM_WEB?PLAYLIST_PATH:PLAYLIST_SD_PATH
-#define REAL_INDEX   config.getMode()==PM_WEB?INDEX_PATH:INDEX_SD_PATH
+// Гибридный выбор плейлиста:
+// 1) В SD-режиме всегда используем SD-файлы.
+// 2) В WEB-режиме источник выбирается через playlistSource (WEB или DLNA).
+// Это подготавливает каркас этапа A без изменения текущего поведения по умолчанию.
+#define REAL_PLAYL   (config.getMode()==PM_SDCARD ? PLAYLIST_SD_PATH : (config.getPlaylistSource()==PL_SRC_DLNA ? PLAYLIST_DLNA_PATH : PLAYLIST_PATH))
+#define REAL_INDEX   (config.getMode()==PM_SDCARD ? INDEX_SD_PATH    : (config.getPlaylistSource()==PL_SRC_DLNA ? INDEX_DLNA_PATH    : INDEX_PATH))
 
 #define MAX_PLAY_MODE   1
 #define WEATHERKEY_LENGTH 58
@@ -40,7 +46,7 @@
   #define ESP_ARDUINO_3 1
 #endif
 
-#define CONFIG_VERSION  8
+#define CONFIG_VERSION  10
 
 /** Время последней активности веб-потока (мс), обновляется из audio_stream_activity. Используется watchdog'ом. */
 extern volatile uint32_t g_lastWebStreamActivityMs;
@@ -48,6 +54,10 @@ extern volatile uint32_t g_lastWebStreamActivityMs;
 extern volatile bool g_audioFormatFlacActive;
 
 enum playMode_e      : uint8_t  { PM_WEB=0, PM_SDCARD=1 };
+// Источник плейлиста для URL-потоков.
+// PL_SRC_WEB  — обычный WEB-плейлист.
+// PL_SRC_DLNA — DLNA-плейлист (каркас для следующих этапов).
+enum PlaylistSource_e : uint8_t { PL_SRC_WEB=0, PL_SRC_DLNA=1 };
 
 void u8fix(char *src);
 
@@ -152,8 +162,8 @@ struct config_t
   bool      trackFactsEnabled;
   char      geminiApiKey[GEMINI_KEY_LENGTH];
   uint8_t   trackFactsLang;  // 0=Russian, 1=English, 2=Auto
-  uint8_t   trackFactsCount; // 1-5 facts per track
-  uint8_t   trackFactsProvider; // 0=Gemini, 1=DeepSeek, 2=iTunes(default), 3=LastFM, 4=MusicBrainz
+  uint8_t   trackFactsCount; // сохранённое число фактов на трек (лимит см. TRACKFACTS_CONFIG_COUNT_MAX в myoptions.h)
+  uint8_t   trackFactsProvider; // 0=Gemini, 1=DeepSeek, 2=iTunes(default), 3=LastFM, 4=Groq
   // Sleep Timer: сохраняем состояние переключателя ALL OFF между перезагрузками
   bool      sleepTimerAllOff;  // true = аппаратное отключение питания по таймеру
   // [FIX SmartStart] Флаг состояния воспроизведения, отделённый от пользовательской настройки smartstart.
@@ -164,6 +174,18 @@ struct config_t
   bool      wasPlaying;
   // Переключение next/prev только по избранным станциям (5-я колонка CSV = "1")
   bool      favOnly;
+  // Текущий источник URL-плейлиста: WEB или DLNA.
+  uint8_t   playlistSource;
+  // Последняя станция в DLNA-плейлисте для последующего восстановления.
+  uint16_t  lastDlnaStation;
+  // Последний активный источник (WEB/DLNA) для корректного возврата после смены режимов.
+  uint8_t   lastPlayedSource;
+  // Хост выбранного DLNA-сервера (ip/host:port), подготавливается на этапе A.
+  char      dlnaHost[64];
+  // Индекс/идентификатор DLNA-контейнера для восстановления навигации.
+  uint16_t  dlnaIDX;
+  // WebUI: показывать нижнюю полоску загрузки CPU (актуально только при WEBUI_CPU_BAR_ENABLE в прошивке).
+  bool      webCpuInfo;
 };
 
 #if IR_PIN!=255
@@ -261,11 +283,22 @@ class Config {
     void changeMode(int newmode=-1);
     uint16_t playlistLength();
     uint16_t lastStation(){
-      return getMode()==PM_WEB?store.lastStation:store.lastSdStation;
+      // Для SD режима всегда используем отдельную позицию SD-плейлиста.
+      if (getMode() == PM_SDCARD) return store.lastSdStation;
+      // Для WEB режима выбор зависит от активного источника плейлиста:
+      // WEB source -> lastStation, DLNA source -> lastDlnaStation.
+      return (getPlaylistSource() == PL_SRC_DLNA) ? store.lastDlnaStation : store.lastStation;
     }
     void lastStation(uint16_t newstation){
-      if(getMode()==PM_WEB) saveValue(&store.lastStation, newstation);
-      else saveValue(&store.lastSdStation, newstation);
+      // Для SD режима сохраняем только SD-позицию.
+      if (getMode() == PM_SDCARD) {
+        saveValue(&store.lastSdStation, newstation);
+        return;
+      }
+      // Для WEB режима сохраняем позицию в выбранный источник.
+      // Это ключевой элемент этапа C: у WEB и DLNA независимые "последние станции".
+      if (getPlaylistSource() == PL_SRC_DLNA) saveValue(&store.lastDlnaStation, newstation);
+      else saveValue(&store.lastStation, newstation);
     }
     char * stationByNum(uint16_t num);
     // Проверяет, является ли станция избранной (5-я колонка CSV = "1")
@@ -287,6 +320,10 @@ class Config {
     void doSleepW();
     void setSnuffle(bool sn);
     uint8_t getMode() { return store.play_mode/* & 0b11*/; }
+    // Получить текущий источник URL-плейлиста (WEB/DLNA).
+    uint8_t getPlaylistSource() { return store.playlistSource; }
+    // Установить источник URL-плейлиста с сохранением в EEPROM.
+    void setPlaylistSource(uint8_t src) { saveValue(&store.playlistSource, src); }
     void initPlaylistMode();
     void reset();
     void enableScreensaver(bool val);
@@ -467,8 +504,16 @@ bool isPlaylistBusy();  // true во время индексации SD или �
 bool isSafeForSSL();   // Проверка heap, WiFi, cooldown перед SSL
 bool isSafeForSSLForFacts();  // Проверка heap/WiFi/cooldown перед SSL для TrackFacts
 
+#ifdef USE_DLNA
+// Этап F DLNA: можно ли запускать тяжёлую сетевую работу worker (SSDP/HTTP/SOAP) без удара по аудио/WebUI.
+// Учитывает режим WEB, WiFi, cooldown смены режима/станции, занятость плейлиста и запас heap.
+bool isSafeForDlnaHeavyWork();
+#endif
+
 bool coverCacheExists(const String& key);
 String coverCacheUrlForKey(const String& key);
+// true только для http(s) с явным расширением картинки (не главная страница станции).
+bool isLikelyDirectCoverImageUrl(const String& url);
 // После завершения SSL в TrackFacts — запустить отложенную загрузку обложки (если была отложена).
 void resumeDeferredCoverDownload(void);
 // Runtime-тоггл показа обложек на TFT (доступен только если DISPLAY_COVERS_ENABLE=true в myoptions.h).

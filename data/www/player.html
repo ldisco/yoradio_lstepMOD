@@ -42,6 +42,8 @@
     </div>
   </div><div>
     <div id="nameset" class="text"></div>
+    <!-- Этап E DLNA: полоска-индикатор только для modedlna (новый id, без правок старых классов). -->
+    <div id="dlna_mode_strip" class="text hidden"></div>
     <div id="meta" class="text"></div>
   </div>
   <div id="playernav">
@@ -136,6 +138,8 @@
     
   <div id="equalizerwrap">
     <div id="equalizerbg" class="hidden" data-target="eqalbutton">
+      <!-- Единая карточка: слайдеры + DLNA, чтобы блок не «висел» отдельно под чёрным фоном. -->
+      <div id="lstep_eq_panel_body">
       <ul id="equalizer">
         <li>
           balance<span class="eqinfo" id="eqbalinfo"></span>
@@ -154,9 +158,30 @@
           <input type="range" id="bass" data-command="bass" data-slaveid="eqbassinfo" min="-16" max="16" value="0">
         </li>
         <li class="formbuttons">
-          <div class="fb local" data-command="toggle" data-target="equalizerbg">Acceptable...</div>
+          <div class="fb local eq-ok-btn" data-command="toggle" data-target="equalizerbg">ok</div>
         </li>
       </ul>
+      <!-- Временное упрощение UI: DLNA только внутри этой карточки (не на основном экране). -->
+      <div id="dlna_panel_wrap" class="hidden">
+        <div id="dlna_panel_title">DLNA</div>
+        <div id="dlna_panel_fields">
+          <label id="dlna_lbl_oid" for="dlna_object_id">objectId</label>
+          <input type="text" id="dlna_object_id" value="0" autocomplete="off" />
+          <label id="dlna_lbl_lim" for="dlna_limit">limit</label>
+          <input type="text" id="dlna_limit" value="200" autocomplete="off" />
+        </div>
+        <div id="dlna_panel_actions">
+          <div class="fb local" data-command="dlna_init">Init</div>
+          <div class="fb local" data-command="dlna_status">Status</div>
+          <div class="fb local" data-command="dlna_refresh">Список</div>
+          <div class="fb local" data-command="dlna_build">Build</div>
+          <div class="fb local" data-command="dlna_append">Append</div>
+          <div class="fb local" data-command="dlna_use_web">Плейлист WEB</div>
+          <div class="fb local" data-command="dlna_use_dlna">Плейлист DLNA</div>
+        </div>
+        <ul id="dlna_container_list"></ul>
+      </div>
+      </div>
     </div>
     <div id="volslider">
       <input type="range" id="volume" data-slaveid="volinfo" data-command="volume" min="0" max="100" value="0">

@@ -15,7 +15,9 @@ extern bool isSafeForSSLForFacts();
 // ============================================================================
 // Запрос к Last.fm API
 // ============================================================================
-FactResult LastFmProvider::fetchFact(const String& artist, const String& title) {
+FactResult LastFmProvider::fetchFact(const String& artist, const String& title,
+                                     const FactFetchContext* ctx) {
+  (void)ctx;
   FactResult result;
   result.success = false;
 

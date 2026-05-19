@@ -19,6 +19,13 @@
 #include "../plugins/SleepTimer/SleepTimer.h"
 #include "../displays/tools/l10n.h"
 #include "config.h" // scheduleChangeModeTask
+#include "cpu_load.h" // webui_freertos_cpu_percent — полоска CPU в WebUI
+
+#ifdef USE_DLNA
+#include "../network/dlna_worker.h"
+#include "../network/dlna_service.h"
+#include "../network/dlna_index.h"
+#endif
 
 #if DSP_MODEL==DSP_DUMMY
 #define DUMMYDISPLAY
@@ -61,7 +68,8 @@ AsyncWebSocket websocket("/ws");
 #define WS_RATE_LIMIT_WINDOW_MS 1000U
 #endif
 #ifndef WS_MAX_MSG_PER_WINDOW
-#define WS_MAX_MSG_PER_WINDOW 10
+// Было 10/с: на телефоне слайдер + heartbeat + bootstrap съедали лимит — команды молча отбрасывались.
+#define WS_MAX_MSG_PER_WINDOW 48
 #endif
 #ifndef WS_TRACKED_CLIENTS
 #define WS_TRACKED_CLIENTS 16
@@ -121,14 +129,58 @@ char* updateError() {
   return netserver.nsBuf;
 }
 
+// Только бейдж «[статус]» в meta без названия трека — не подменять на currentFactTrackLabelForApi() в /api/current-fact.
+static bool metaTitleIsSystemBadgeOnly(const String& raw) {
+  String s = raw;
+  s.trim();
+  const int n = (int)s.length();
+  if (n < 3) return false;
+  if (s.charAt(0) != '[') return false;
+  const int rb = s.indexOf(']');
+  if (rb <= 0) return false;
+  for (int i = rb + 1; i < n; i++) {
+    if (s.charAt(i) != ' ') return false;
+  }
+  return true;
+}
+
+#ifdef USE_DLNA
+namespace {
+// Краткое экранирование строки для безопасной вставки в JSON в кавычках (host, error, URL).
+static void dlnaJsonEscape(const char* src, char* dst, size_t dstLen) {
+  size_t j = 0;
+  if (!src) {
+    src = "";
+  }
+  for (size_t i = 0; src[i] != '\0' && j + 2 < dstLen; ++i) {
+    if (src[i] == '\\' || src[i] == '\"') {
+      dst[j++] = '\\';
+      if (j + 1 >= dstLen) {
+        break;
+      }
+    }
+    dst[j++] = src[i];
+  }
+  dst[j] = '\0';
+}
+}  // namespace
+#endif
+
 bool NetServer::begin(bool quiet) {
   if(network.status==SDREADY) return true;
   if(!quiet) Serial.print("##[BOOT]#\tnetserver.begin\t");
   importRequest = IMDONE;
   irRecordEnable = false;
   playerBufMax = psramInit()?300000:1600 * config.store.abuff;
-  nsQueue = xQueueCreate( 32, sizeof( nsRequestParams_t ) );
+  nsQueue = xQueueCreate( 96, sizeof( nsRequestParams_t ) );
   while(nsQueue==NULL){;}
+
+#ifdef USE_DLNA
+  // Этап D: фоновый worker DLNA (очередь задач вне колбэков AsyncWebServer/WebSocket).
+  if (!dlnaWorker.begin() && !quiet) {
+    Serial.println("##[BOOT]#\tDLNA: dlnaWorker.begin failed");
+  }
+#endif
 
   //webserver.addHandler(new SPIFFSEditor(LittleFS, "admin", "admin"));
 
@@ -167,7 +219,7 @@ webserver.on("/upload", HTTP_GET, [](AsyncWebServerRequest *request){
 
   auto sendIndexHtml = [](AsyncWebServerRequest *request) {
     AsyncWebServerResponse *response = request->beginResponse_P(200, "text/html", index_html);
-    response->addHeader("Cache-Control","max-age=31536000");
+    response->addHeader("Cache-Control", "max-age=31536000");
     request->send(response);
   };
 
@@ -176,11 +228,20 @@ webserver.on("/upload", HTTP_GET, [](AsyncWebServerRequest *request){
   webserver.on("/ir.html", HTTP_ANY, sendIndexHtml);
 
   webserver.on("/variables.js", HTTP_GET, [](AsyncWebServerRequest *request) {
+    // dlnaSupported: этап E WebUI — скрывать блок DLNA на прошивках без USE_DLNA.
+#ifdef USE_DLNA
     snprintf(netserver.nsBuf, sizeof(netserver.nsBuf),
-             "var yoVersion='%s';\nvar formAction='%s';\nvar playMode='%s';\n",
+             "var yoVersion='%s';\nvar formAction='%s';\nvar playMode='%s';\nvar dlnaSupported=1;\n",
              YOVERSION,
-             (network.status == CONNECTED && !config.emptyFS)?"webboard":"",
-             (network.status == CONNECTED)?"player":"ap");
+             (network.status == CONNECTED && !config.emptyFS) ? "webboard" : "",
+             (network.status == CONNECTED) ? "player" : "ap");
+#else
+    snprintf(netserver.nsBuf, sizeof(netserver.nsBuf),
+             "var yoVersion='%s';\nvar formAction='%s';\nvar playMode='%s';\nvar dlnaSupported=0;\n",
+             YOVERSION,
+             (network.status == CONNECTED && !config.emptyFS) ? "webboard" : "",
+             (network.status == CONNECTED) ? "player" : "ap");
+#endif
     request->send(200, "application/javascript", netserver.nsBuf);
   });
 
@@ -371,7 +432,8 @@ webserver.on("/dragpl.js", HTTP_GET, [](AsyncWebServerRequest *request) {
 // и стримит из одного file handle. Это радикально ускоряет отдачу
 // и не блокирует другие HTTP-запросы.
 webserver.on("/api/playlist", HTTP_GET, [](AsyncWebServerRequest *request){
-  const char* playlistPath = (config.getMode() == PM_SDCARD) ? PLAYLIST_SD_PATH : PLAYLIST_PATH;
+  // REAL_PLAYL учитывает PM_SDCARD и гибрид WEB/DLNA (PL_SRC_*), иначе WebUI всегда тянул бы только /data/playlist.csv.
+  const char* playlistPath = (config.getMode() == PM_SDCARD) ? PLAYLIST_SD_PATH : REAL_PLAYL;
 
   if (!LittleFS.exists(playlistPath)) {
     Serial.printf("[API] Плейлист не найден: %s\n", playlistPath);
@@ -385,6 +447,126 @@ webserver.on("/api/playlist", HTTP_GET, [](AsyncWebServerRequest *request){
   response->addHeader("Cache-Control", "no-cache");
   request->send(response);
 });
+
+#ifdef USE_DLNA
+  // --- Этап D: HTTP API DLNA (контракт DLNA_INTEGRATION_PLAN.md §6.1). Тяжёлые операции только через dlnaWorker. ---
+  webserver.on("/dlna/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+    DlnaWorkerStatus s = dlnaWorker.status();
+    char errEsc[128];
+    dlnaJsonEscape(s.lastError, errEsc, sizeof(errEsc));
+    snprintf(netserver.nsBuf, sizeof(netserver.nsBuf),
+             "{\"running\":%u,\"busy\":%u,\"processed\":%lu,\"lastJob\":%u,\"queue\":%u,\"error\":\"%s\"}",
+             s.running ? 1u : 0u,
+             s.busy ? 1u : 0u,
+             (unsigned long)s.processedJobs,
+             (unsigned)s.lastJob,
+             (unsigned)s.queueWaiting,
+             errEsc);
+    request->send(200, "application/json", netserver.nsBuf);
+  });
+
+  webserver.on("/dlna/info", HTTP_GET, [](AsyncWebServerRequest *request) {
+    (void)request;
+    char hostE[96], ctrlE[200], rootE[96], cfgE[96];
+    dlnaJsonEscape(dlnaService.host().c_str(), hostE, sizeof(hostE));
+    dlnaJsonEscape(dlnaService.controlUrl().c_str(), ctrlE, sizeof(ctrlE));
+    dlnaJsonEscape(dlnaService.rootObjectId().c_str(), rootE, sizeof(rootE));
+    dlnaJsonEscape(config.store.dlnaHost, cfgE, sizeof(cfgE));
+    snprintf(netserver.nsBuf, sizeof(netserver.nsBuf),
+             "{\"host\":\"%s\",\"controlUrl\":\"%s\",\"rootObjectId\":\"%s\",\"ready\":%u,\"cfgHost\":\"%s\"}",
+             hostE,
+             ctrlE,
+             rootE,
+             dlnaService.ready() ? 1u : 0u,
+             cfgE);
+    request->send(200, "application/json", netserver.nsBuf);
+  });
+
+  webserver.on("/dlna/init", HTTP_GET, [](AsyncWebServerRequest *request) {
+    (void)request;
+    DlnaWorkerJob job = {DLNA_JOB_INIT, "", 0};
+    bool q = dlnaWorker.enqueue(job, 50);
+    snprintf(netserver.nsBuf, sizeof(netserver.nsBuf), "{\"ok\":%u,\"queued\":%u}", q ? 1u : 0u, q ? 1u : 0u);
+    request->send(200, "application/json", netserver.nsBuf);
+  });
+
+  webserver.on("/dlna/list", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String oid = request->hasParam("objectId") ? request->getParam("objectId")->value() : String("0");
+    int start = 0;
+    if (request->hasParam("start")) {
+      start = request->getParam("start")->value().toInt();
+    }
+    snprintf(netserver.nsBuf, sizeof(netserver.nsBuf),
+             "{\"items\":[],\"objectId\":\"%.120s\",\"start\":%d,\"note\":\"browse: заглушка до SOAP/DIDL\"}",
+             oid.c_str(),
+             start);
+    request->send(200, "application/json", netserver.nsBuf);
+  });
+
+  webserver.on("/dlna/build", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String oid = request->hasParam("objectId") ? request->getParam("objectId")->value() : String("0");
+    uint16_t lim = 200;
+    if (request->hasParam("limit")) {
+      int v = request->getParam("limit")->value().toInt();
+      if (v > 0 && v <= 65535) {
+        lim = (uint16_t)v;
+      }
+    }
+    DlnaWorkerJob job = {DLNA_JOB_BUILD, "", lim};
+    oid.trim();
+    if (oid.length() == 0) {
+      strlcpy(job.objectId, "0", sizeof(job.objectId));
+    } else {
+      strlcpy(job.objectId, oid.c_str(), sizeof(job.objectId));
+      job.objectId[sizeof(job.objectId) - 1] = '\0';
+    }
+    bool q = dlnaWorker.enqueue(job, 50);
+    snprintf(netserver.nsBuf, sizeof(netserver.nsBuf),
+             "{\"queued\":%u,\"objectId\":\"%.63s\",\"limit\":%u}",
+             q ? 1u : 0u,
+             job.objectId,
+             (unsigned)lim);
+    request->send(200, "application/json", netserver.nsBuf);
+  });
+
+  webserver.on("/dlna/append", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String oid = request->hasParam("objectId") ? request->getParam("objectId")->value() : String("0");
+    uint16_t lim = 200;
+    if (request->hasParam("limit")) {
+      int v = request->getParam("limit")->value().toInt();
+      if (v > 0 && v <= 65535) {
+        lim = (uint16_t)v;
+      }
+    }
+    DlnaWorkerJob job = {DLNA_JOB_APPEND, "", lim};
+    oid.trim();
+    if (oid.length() == 0) {
+      strlcpy(job.objectId, "0", sizeof(job.objectId));
+    } else {
+      strlcpy(job.objectId, oid.c_str(), sizeof(job.objectId));
+      job.objectId[sizeof(job.objectId) - 1] = '\0';
+    }
+    bool q = dlnaWorker.enqueue(job, 50);
+    snprintf(netserver.nsBuf, sizeof(netserver.nsBuf),
+             "{\"queued\":%u,\"objectId\":\"%.63s\",\"limit\":%u}",
+             q ? 1u : 0u,
+             job.objectId,
+             (unsigned)lim);
+    request->send(200, "application/json", netserver.nsBuf);
+  });
+
+  webserver.on("/playlist/dlna", HTTP_GET, [](AsyncWebServerRequest *request) {
+    (void)request;
+    netserver.requestOnChange(PLAYLISTSRC_DLNA, 0);
+    request->send(200, "application/json", "{\"ok\":true,\"source\":\"dlna\"}");
+  });
+
+  webserver.on("/playlist/web", HTTP_GET, [](AsyncWebServerRequest *request) {
+    (void)request;
+    netserver.requestOnChange(PLAYLISTSRC_WEB, 0);
+    request->send(200, "application/json", "{\"ok\":true,\"source\":\"web\"}");
+  });
+#endif
 
 #include "player.h" // Чтобы сервер знал о классе Player
 extern Player player; 
@@ -485,7 +667,7 @@ webserver.on("/api/current-cover", HTTP_GET, [](AsyncWebServerRequest *request) 
       if (streamCoverUrl.length() > 8) {
         String sc = streamCoverUrl;
         sc.trim();
-        if (sc.startsWith("http://") || sc.startsWith("https://")) {
+        if ((sc.startsWith("http://") || sc.startsWith("https://")) && isLikelyDirectCoverImageUrl(sc)) {
           effectiveUrl = sc;
           haveDirectIcyLogo = true;
         }
@@ -501,6 +683,21 @@ webserver.on("/api/current-cover", HTTP_GET, [](AsyncWebServerRequest *request) 
             coverTitleLower.indexOf("timeout") < 0) {
           effectiveUrl = "SEARCH_ITUNES";
         }
+      }
+    }
+
+    // Не отдаём в WebUI ссылку на HTML/главную как «обложку» (например https://roxyradio.hu/).
+    // Если в effectiveUrl попал такой URL — даём клиенту iTunes при нормальном title (как у Roxy FLAC).
+    if ((effectiveUrl.startsWith("http://") || effectiveUrl.startsWith("https://")) &&
+        !isLikelyDirectCoverImageUrl(effectiveUrl)) {
+      effectiveUrl = "/logo.svg";
+      String coverTitleLower2 = coverTitle;
+      coverTitleLower2.toLowerCase();
+      extern volatile bool g_modeSwitching;
+      if (WEBUI_COVERS_ENABLE && player.status() == PLAYING && !g_modeSwitching &&
+          coverTitle.length() >= 3 && !coverTitle.startsWith("[") &&
+          coverTitleLower2.indexOf("timeout") < 0) {
+        effectiveUrl = "SEARCH_ITUNES";
       }
     }
 
@@ -536,6 +733,10 @@ webserver.on("/api/current-fact", HTTP_GET, [](AsyncWebServerRequest *request) {
       title = String(LANG::const_PlConnect);
     } else if (metaTitle.length() > 0) {
       title = metaTitle;
+      if (trackFactsPlugin.isEnabled() && !metaTitleIsSystemBadgeOnly(metaTitle)) {
+        String cleanTitle = trackFactsPlugin.currentFactTrackLabelForApi();
+        if (cleanTitle.length() > 0) title = cleanTitle;
+      }
     } else {
       title = String(config.station.name);
     }
@@ -588,8 +789,25 @@ webserver.on("/api/current-fact", HTTP_GET, [](AsyncWebServerRequest *request) {
     escapedTitle.replace("\"", "\\\"");
     escapedTitle.replace("\n", " ");
     
-    // [FIX] pending=1 если запрос факта в очереди/выполняется, status — служебное сообщение
-    String json = "{\"facts\":" + jsonFacts + ",\"title\":\"" + escapedTitle + "\",\"pending\":" + String(trackFactsPlugin.isRequestPending() ? 1 : 0) + ",\"status\":\"" + status + "\"}";
+    // В стопе не считаем запрос «висящим» — WebUI закрывает диалог и не крутит таймер ожидания.
+    const bool playbackActive = (player.status() == PLAYING);
+    // pending=1: активный запрос ИЛИ ещё не добрана серия facts-per-track (диалог должен продолжать опрос)
+    const bool factPending =
+        playbackActive &&
+        (trackFactsPlugin.isRequestPending() || trackFactsPlugin.isMultiFactGatherOngoing());
+    // requestPending=1: только реальный активный запрос к провайдеру.
+    // Это поле нужно WebUI для показа "⏳" строго в момент сетевого запроса,
+    // без ложного постоянного индикатора при незавершённой итеративной серии.
+    const bool requestPending =
+        playbackActive &&
+        trackFactsPlugin.isRequestPending();
+    const bool manualMore =
+        playbackActive && trackFactsPlugin.isEnabled() &&
+        trackFactsPlugin.manualMoreFragmentsUi() && fact.length() > 0;
+    const bool incompleteIterative =
+        playbackActive && trackFactsPlugin.isEnabled() &&
+        trackFactsPlugin.incompleteIterativeSeriesForApi();
+    String json = "{\"facts\":" + jsonFacts + ",\"title\":\"" + escapedTitle + "\",\"pending\":" + String(factPending ? 1 : 0) + ",\"requestPending\":" + String(requestPending ? 1 : 0) + ",\"manualMore\":" + String(manualMore ? 1 : 0) + ",\"incompleteIterative\":" + String(incompleteIterative ? 1 : 0) + ",\"tfprovider\":" + String((int)config.store.trackFactsProvider) + ",\"factsAi\":" + String(trackFactsPlugin.factsContentFromAi() ? 1 : 0) + ",\"status\":\"" + status + "\"}";
     
     AsyncWebServerResponse *response = request->beginResponse(200, "application/json", json);
     
@@ -783,7 +1001,8 @@ void NetServer::chunkedHtmlPage(const String& contentType, AsyncWebServerRequest
   display.lock();
   #endif
   response = request->beginChunkedResponse(contentType, chunkedHtmlPageCallback);
-  response->addHeader("Cache-Control","max-age=31536000");
+  // HTML-оболочки (player/options): без годового кэша — иначе после обновления прошивки нужен Ctrl+F5.
+  response->addHeader("Cache-Control", "no-cache");
   request->send(response);
 }
 
@@ -819,10 +1038,10 @@ void NetServer::processQueue(){
   // визуально «умирал» Web, хотя система продолжала работать.
   //
   // Новый подход:
-  //  - лимит делаем более гибким и чуть выше (24);
+  //  - лимит делаем более гибким и выше (48);
   //  - при желании можно будет дополнительно адаптировать его под Heap/режим.
   int processed = 0;
-  const int maxPerCycle = 24;  // обрабатываем до 24 запросов за один проход
+  const int maxPerCycle = 48;  // обрабатываем до 48 запросов за один проход
   nsRequestParams_t request;
   while(processed < maxPerCycle && xQueueReceive(nsQueue, &request, NS_QUEUE_TICKS)){
     processed++;
@@ -842,8 +1061,15 @@ void NetServer::processQueue(){
         }
         #endif
         if(config.getMode()==PM_WEB){
-          config.indexPlaylist(); 
-          config.initPlaylist(); 
+#ifdef USE_DLNA
+          if (config.getPlaylistSource() == PL_SRC_DLNA) {
+            dlnaIndex.rebuildIndexFromPlaylist();
+          } else
+#endif
+          {
+            config.indexPlaylist();
+          }
+          config.initPlaylist();
         }
         getPlaylist(clientId); break;
       }
@@ -890,22 +1116,29 @@ void NetServer::processQueue(){
           break;
         }
       case GETINDEX:      {
-          requestOnChange(STATION, clientId); 
-          requestOnChange(TITLE, clientId); 
+          // Сначала STATION и MODE, затем TITLE: иначе WebUI получает meta раньше,
+          // чем playerwrap перейдёт в playing, и клиентский guard отбрасывает тег
+          // до следующей смены трека в эфире.
+          requestOnChange(STATION, clientId);
+          requestOnChange(MODE, clientId);
+          requestOnChange(TITLE, clientId);
           requestOnChange(VOLUME, clientId); 
           requestOnChange(EQUALIZER, clientId); 
           requestOnChange(BALANCE, clientId); 
           requestOnChange(BITRATE, clientId); 
-          requestOnChange(MODE, clientId); 
           requestOnChange(SDINIT, clientId);
           requestOnChange(GETPLAYERMODE, clientId); 
           if (config.getMode()==PM_SDCARD) { requestOnChange(SDPOS, clientId); requestOnChange(SDLEN, clientId); requestOnChange(SDSNUFFLE, clientId); } 
           // Таймер сна: pushState при старте мог уйти в пустой эфир — досылаем подключившемуся клиенту.
           sleepTimerPlugin.pushState(clientId);
-          return; 
+          // Важно не завершать весь processQueue() здесь:
+          // после GETINDEX в очереди уже могут лежать другие события для UI,
+          // и их нужно обработать в этом же проходе цикла.
           break;
         }
-      case GETSYSTEM:     snprintf (wsBuf, sizeof(wsBuf), "{\"sst\":%d,\"aif\":%d,\"vu\":%d,\"softr\":%d,\"vut\":%d,\"mdns\":\"%s\",\"ipaddr\":\"%s\", \"abuff\": %d, \"telnet\": %d, \"watchdog\": %d }", 
+      // webcpu — прошивка собрана с WEBUI_CPU_BAR_ENABLE (показ переключателя в настройках).
+      // wci — пользовательское «CPU Info» (полоска в WebUI), поле config.store.webCpuInfo.
+      case GETSYSTEM:     snprintf (wsBuf, sizeof(wsBuf), "{\"sst\":%d,\"aif\":%d,\"vu\":%d,\"softr\":%d,\"vut\":%d,\"mdns\":\"%s\",\"ipaddr\":\"%s\", \"abuff\": %d, \"telnet\": %d, \"watchdog\": %d, \"webcpu\": %d, \"wci\": %d }", 
                                   config.store.smartstart != 2, 
                                   config.store.audioinfo, 
                                   config.store.vumeter, 
@@ -915,7 +1148,9 @@ void NetServer::processQueue(){
                                   config.ipToStr(WiFi.localIP()),
                                   config.store.abuff,
                                   config.store.telnet,
-                                  config.store.watchdog); 
+                                  config.store.watchdog,
+                                  WEBUI_CPU_BAR_ENABLE ? 1 : 0,
+                                  config.store.webCpuInfo ? 1 : 0); 
                                   break;
       case GETSCREEN:     snprintf (wsBuf, sizeof(wsBuf), "{\"flip\":%d,\"inv\":%d,\"nump\":%d,\"coven\":%d,\"covopt\":%d,\"tsf\":%d,\"tsd\":%d,\"dspon\":%d,\"br\":%d,\"con\":%d,\"scre\":%d,\"scrt\":%d,\"scrb\":%d,\"scrpe\":%d,\"scrpt\":%d,\"scrpb\":%d}", 
                                   config.store.flipscreen, 
@@ -1004,7 +1239,19 @@ void NetServer::processQueue(){
       case VOLUME:        snprintf (wsBuf, sizeof(wsBuf), "{\"payload\":[{\"id\":\"volume\", \"value\": %d}]}", (config.store.volume * 100) / 254); telnet.printf("##CLI.VOL#: %d\n", config.store.volume); break;
       // [Gemini3Pro] Добавлена проверка playerBufMax > 0 для защиты от деления на ноль
       // Процент буфера считаем от реального размера (player.getInBufferSize()), как в [DIAG], чтобы веб/дисплей совпадали с логом.
-      case NRSSI:         { uint32_t total = player.getInBufferSize(); int heapPct = (player.isRunning() && config.store.audioinfo && total > 0) ? (int)(100*player.inBufferFilled()/total) : 0; snprintf (wsBuf, sizeof(wsBuf), "{\"payload\":[{\"id\":\"rssi\", \"value\": %d}, {\"id\":\"heap\", \"value\": %d}]}", rssi, heapPct); } break;
+      case NRSSI:         { uint32_t total = player.getInBufferSize(); int heapPct = (player.isRunning() && config.store.audioinfo && total > 0) ? (int)(100*player.inBufferFilled()/total) : 0;
+#if WEBUI_CPU_BAR_ENABLE
+                                  // Полоску CPU шлём только если и сборка, и пользователь включил «CPU Info» (экономия и скрытие визуала).
+                                  if (config.store.webCpuInfo) {
+                                    const int cpuPct = webui_freertos_cpu_percent();
+                                    snprintf (wsBuf, sizeof(wsBuf), "{\"payload\":[{\"id\":\"rssi\", \"value\": %d}, {\"id\":\"heap\", \"value\": %d}, {\"id\":\"cpubar\", \"value\": %d}]}", rssi, heapPct, cpuPct);
+                                  } else {
+                                    snprintf (wsBuf, sizeof(wsBuf), "{\"payload\":[{\"id\":\"rssi\", \"value\": %d}, {\"id\":\"heap\", \"value\": %d}]}", rssi, heapPct);
+                                  }
+#else
+                                  snprintf (wsBuf, sizeof(wsBuf), "{\"payload\":[{\"id\":\"rssi\", \"value\": %d}, {\"id\":\"heap\", \"value\": %d}]}", rssi, heapPct);
+#endif
+                                  } break;
       case SDPOS:         {
                                   // Вызывать getFilePos/getFileSize только в SD-режиме — иначе "audio is not a file" при переходе SD->WEB
                                   // (запрос мог остаться в очереди до смены режима).
@@ -1023,8 +1270,62 @@ void NetServer::processQueue(){
       case EQUALIZER:     snprintf (wsBuf, sizeof(wsBuf), "{\"payload\":[{\"id\":\"bass\", \"value\": %d}, {\"id\": \"middle\", \"value\": %d}, {\"id\": \"trebble\", \"value\": %d}]}", config.store.bass, config.store.middle, config.store.trebble); break;
       case BALANCE:       snprintf (wsBuf, sizeof(wsBuf), "{\"payload\":[{\"id\": \"balance\", \"value\": %d}]}", config.store.balance); break;
       case SDINIT:        snprintf (wsBuf, sizeof(wsBuf), "{\"sdinit\": %d}", SDC_CS!=255); break;
-      case GETPLAYERMODE: snprintf (wsBuf, sizeof(wsBuf), "{\"playermode\": \"%s\"}", config.getMode()==PM_SDCARD?"modesd":"modeweb"); break;
+      case GETPLAYERMODE: {
+          const char* pm = "modeweb";
+          if (config.getMode() == PM_SDCARD) {
+            pm = "modesd";
+          }
+#ifdef USE_DLNA
+          else if (config.getPlaylistSource() == PL_SRC_DLNA) {
+            pm = "modedlna";
+          }
+#endif
+          snprintf(wsBuf, sizeof(wsBuf), "{\"playermode\": \"%s\"}", pm);
+          break;
+        }
       case SDINDEXING:    snprintf (wsBuf, sizeof(wsBuf), "{\"sdindexing\": %d}", config.sdIndexing ? 1 : 0); break;
+#ifdef USE_DLNA
+      case PLAYLISTSRC_DLNA: {
+          if (config.getMode() == PM_SDCARD) {
+            break;
+          }
+          config.setPlaylistSource(PL_SRC_DLNA);
+          dlnaService.setHost(String(config.store.dlnaHost));
+          config.initPlaylist();
+          dlnaIndex.rebuildIndexFromPlaylist();
+          if (player.status() == PLAYING) {
+            player.sendCommand({PR_PLAY, (int)config.lastStation()});
+          } else {
+            config.loadStation(config.lastStation());
+          }
+          requestOnChange(PLAYLIST, clientId);
+          requestOnChange(STATIONNAME, clientId);
+          requestOnChange(STATION, clientId);
+          requestOnChange(ITEM, clientId);
+          requestOnChange(TITLE, clientId);
+          requestOnChange(GETPLAYERMODE, clientId);
+          break;
+        }
+      case PLAYLISTSRC_WEB: {
+          if (config.getMode() == PM_SDCARD) {
+            break;
+          }
+          config.setPlaylistSource(PL_SRC_WEB);
+          config.initPlaylist();
+          if (player.status() == PLAYING) {
+            player.sendCommand({PR_PLAY, (int)config.lastStation()});
+          } else {
+            config.loadStation(config.lastStation());
+          }
+          requestOnChange(PLAYLIST, clientId);
+          requestOnChange(STATIONNAME, clientId);
+          requestOnChange(STATION, clientId);
+          requestOnChange(ITEM, clientId);
+          requestOnChange(TITLE, clientId);
+          requestOnChange(GETPLAYERMODE, clientId);
+          break;
+        }
+#endif
       #ifdef USE_SD
         case CHANGEMODE: {
           {
@@ -1141,16 +1442,17 @@ void NetServer::irValsToWs() {
 
 void NetServer::onWsMessage(void *arg, uint8_t *data, size_t len, uint8_t clientId) {
   AwsFrameInfo *info = (AwsFrameInfo*)arg;
-  // Rate limit incoming WS messages per client to avoid floods
-  if (!ws_rate_allowed(clientId)) {
-    if (config.store.audioinfo) Serial.printf("[WEBSOCKET] client #%lu rate limit exceeded\n", (unsigned long)clientId);
-    return;
-  }
   if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
     char local[128];
     size_t safeLen = (len >= sizeof(local)) ? sizeof(local) - 1 : len;
     memcpy(local, data, safeLen);
     local[safeLen] = 0;
+    // ping не учитываем в лимите — иначе конкурирует с реальным UI на мобильных.
+    bool pingKeepalive = (safeLen >= 5 && strncmp(local, "ping=", 5) == 0);
+    if (!pingKeepalive && !ws_rate_allowed(clientId)) {
+      if (config.store.audioinfo) Serial.printf("[WEBSOCKET] client #%lu rate limit exceeded\n", (unsigned long)clientId);
+      return;
+    }
     if (config.parseWsCommand(local, _wscmd, sizeof(_wscmd), _wsval, sizeof(_wsval))) {
       if (strcmp(_wscmd, "ping") == 0) {
         websocket.text(clientId, "{\"pong\": 1}");
@@ -1277,31 +1579,36 @@ void NetServer::requestOnChange(requestType_e request, uint8_t clientId) {
   // просто не попадали в очередь. В результате WebUI переставал получать данные
   // и визуально «умирал», хотя устройство продолжало играть и отвечать.
   //
-  // Новый подход: добавляем только мягкую защиту «очевидного переполнения» —
-  // не шлём запрос, если в очереди НЕТ свободных слотов вообще.
+  // Новый подход: при переполнении пропускаем только «не критичные» события.
+  // Критичные статусы (TITLE/STATION/MODE/GETACTIVE/GETINDEX) пытаемся доставить даже при высокой нагрузке.
   UBaseType_t freeSlots = uxQueueSpacesAvailable(nsQueue);
-  if (freeSlots == 0) {
-    // Очередь реально забита «под завязку» — аккуратно пропускаем событие.
+  bool isCritical =
+    request == TITLE ||
+    request == STATION ||
+    request == STATIONNAME ||
+    request == ITEM ||
+    request == MODE ||
+    request == GETACTIVE ||
+    request == GETINDEX ||
+    request == GETPLAYERMODE
+#ifdef USE_DLNA
+    || request == PLAYLISTSRC_DLNA ||
+    request == PLAYLISTSRC_WEB
+#endif
+    ;
+  if (freeSlots == 0 && !isCritical) {
     return;
   }
   
-  // [FIX] Предотвращаем рекурсивный loop() внутри xQueueSend, если мы уже находимся в процессе сетевой обработки.
-  // Это может вызвать двойной вызов pbuf_free в lwIP и панику ядра (assert p->ref > 0)
-  static bool inRequest = false;
-  if (inRequest) return;
-  inRequest = true;
-
   // [FIX][SD+WEB] Формируем событие для WebSocket-очереди.
   nsRequestParams_t nsrequest;
   // [FIX][SD+WEB] Сохраняем тип изменения (meta, sdpos, mode и т.д.).
   nsrequest.type = request;
   // [FIX][SD+WEB] Сохраняем целевой clientId (0 = broadcast всем клиентам).
   nsrequest.clientId = clientId;
-  // [FIX][SD+WEB] Неблокирующая отправка: при переполнении просто пропускаем событие,
-  // чтобы не блокировать поток, который вызвал requestOnChange (критично для плавного SD-аудио).
-  xQueueSend(nsQueue, &nsrequest, NSQ_SEND_DELAY);
-
-  inRequest = false;
+  // Критичные события ждём коротко (до 2 мс), чтобы не терять title/menu.
+  TickType_t sendTicks = (freeSlots == 0 && isCritical) ? pdMS_TO_TICKS(2) : NSQ_SEND_DELAY;
+  xQueueSend(nsQueue, &nsrequest, sendTicks);
 }
 
 void NetServer::resetQueue(){
@@ -1494,7 +1801,7 @@ void handleNotFound(AsyncWebServerRequest * request) {
   if (strcmp(request->url().c_str(), "/settings.html") == 0 || strcmp(request->url().c_str(), "/update.html") == 0 || strcmp(request->url().c_str(), "/ir.html") == 0){
     //request->send_P(200, "text/html", index_html);
     AsyncWebServerResponse *response = request->beginResponse_P(200, "text/html", index_html);
-    response->addHeader("Cache-Control","max-age=31536000");
+    response->addHeader("Cache-Control", "no-cache");
     request->send(response);
     return;
   }
@@ -1538,7 +1845,7 @@ void handleIndex(AsyncWebServerRequest * request) {
     // Редирект на settings только когда реально нужна настройка (AP/нет сети), а не при работе в SD.
     if (network.status == CONNECTED || network.status == SDREADY) {
       AsyncWebServerResponse *response = request->beginResponse_P(200, "text/html", index_html);
-      response->addHeader("Cache-Control","max-age=31536000");
+      response->addHeader("Cache-Control", "max-age=31536000");
       request->send(response);
     } else {
       request->redirect("/settings.html");

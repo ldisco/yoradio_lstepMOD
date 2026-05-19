@@ -26,6 +26,9 @@
 #ifdef USE_NEXTION
 #include "../displays/nextion.h"
 #endif
+#ifdef USE_DLNA
+#include "../network/dlna_index.h"
+#endif
 #include <cstddef>
 #if defined(ESP32) && defined(ARDUINO)
 #include <esp_heap_caps.h>
@@ -43,8 +46,14 @@ void audio_stream_activity(void) {
 }
 
 // === Асинхронное переключение режимов (WEB <-> SD) ===
-
-// Переносим changeMode в отдельную FreeRTOS-задачу.
+// Задача: убрать фризы WebUI при переключении режимов.
+// Проблема: Config::changeMode() может выполнять тяжёлые операции (SD mount, индекс),
+// а вызов происходил из NetServer::processQueue() — то есть из кода, который должен
+// быстро обрабатывать WebSocket очередь. Когда changeMode «долго думает», браузер
+// получает таймауты и кажется, что Web «умер», хотя устройство продолжает играть.
+//
+// Решение: переносим changeMode в отдельную FreeRTOS-задачу. Так Web остаётся живым,
+// даже если SD‑индексация длится десятки секунд.
 static volatile bool g_changeModeTaskRunning = false;
 static volatile int  g_changeModeTaskRequestedMode = -1;
 
@@ -516,6 +525,44 @@ bool isSafeForSSLForFacts() {
   return true;
 }
 
+#ifdef USE_DLNA
+// Этап F (DLNA_INTEGRATION_PLAN §7 п.6): тяжёлые DLNA-операции не должны совпадать с окнами
+// переключения режима/станции и низким heap — иначе растёт риск фризов WebSocket и артефактов звука.
+bool isSafeForDlnaHeavyWork() {
+  // DLNA-плейлист и HTTP-контур имеют смысл только в WEB-режиме (в SD свой плейлист и другая логика).
+  if (config.getMode() != PM_WEB) {
+    return false;
+  }
+  // Согласованность с isSafeForSSL: пока открыт экран настроек на дисплее, не грузим сеть лишним DLNA.
+  if (display.mode() == SETTINGS) {
+    return false;
+  }
+  if (g_modeSwitching) {
+    return false;
+  }
+  if (isModeSwitchCooldown()) {
+    return false;
+  }
+  // Пока идёт индексация SD или тяжёлое сохранение избранного — не конкурируем за heap и SPI flash.
+  if (isPlaylistBusy()) {
+    return false;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+  // Окно после смены станции: совпадает с политикой TrackFacts/обложек — не добавляем второй HTTPS/HTTP пик.
+  if (isStationSwitchSslBlock()) {
+    return false;
+  }
+  const uint32_t freeHeap = ESP.getFreeHeap();
+  // Порог мягче полного SSL (MIN_HEAP_FOR_SSL), но достаточный, чтобы не стартовать при «красной» зоне кучи.
+  if (freeHeap < (MIN_HEAP_FOR_SSL / 2)) {
+    return false;
+  }
+  return true;
+}
+#endif
+
 // === PSRAM-кэширование ключевых WebUI-файлов ===
 // [FIX v2] Кэшируем ВСЕ файлы WebUI, а не только script.js и style.css.
 // Мобильные браузеры запрашивают 6-8 файлов одновременно.
@@ -524,6 +571,10 @@ bool isSafeForSSLForFacts() {
 // Из PSRAM всё отдаётся мгновенно — нет блокировок SPI.
 //
 // Суммарный объём кэша ~42 КБ (из 8 МБ PSRAM)
+// Верхняя граница одного файла: при битой таблице LittleFS size() может быть мусором → защита PSRAM/кучи.
+#ifndef WEB_ASSET_CACHE_MAX_BYTES
+#define WEB_ASSET_CACHE_MAX_BYTES (512 * 1024)
+#endif
 void initWebAssetsCache() {
   if (!psramInit()) {
     Serial.println("[WEB-CACHE] PSRAM не обнаружен, кэш WebUI отключён");
@@ -586,6 +637,13 @@ void initWebAssetsCache() {
       Serial.printf("[WEB-CACHE] Пустой файл %s, кэширование не имеет смысла\n", a.path);
       continue;
     }
+    if (size > WEB_ASSET_CACHE_MAX_BYTES) {
+      f.close();
+      unlockLittleFS();
+      Serial.printf("[WEB-CACHE] Файл %s слишком большой для кэша (%u > %u), пропуск\n",
+                    a.path, (unsigned)size, (unsigned)WEB_ASSET_CACHE_MAX_BYTES);
+      continue;
+    }
 
     // Выделяем буфер в PSRAM под весь файл разом.
     uint8_t* buf = (uint8_t*)ps_malloc(size);
@@ -643,9 +701,12 @@ static bool isHttpUrl(const String& url) {
 
 // В icy-url / icy-logo часто приходит ссылка на сайт станции (Telegram, YouTube и т.д.),
 // а не прямой JPEG/PNG — скачивание как картинки даёт connection refused / мусор и съедает TLS/heap.
-static bool isLikelyDirectCoverImageUrl(const String& url) {
+// Не требуем расширение в пути — иначе ломаются нормальные CDN без .jpg в URL.
+// Отсекаем только «голый» корень хоста (https://roxyradio.hu/, https://example.com) — это HTML, не картинка.
+bool isLikelyDirectCoverImageUrl(const String& url) {
   if (!isHttpUrl(url)) return false;
   String low = url;
+  low.trim();
   low.toLowerCase();
   static const char* kDeny[] = {
       "t.me/",       "telegram.me/", "youtube.com/", "youtu.be/",
@@ -655,6 +716,21 @@ static bool isLikelyDirectCoverImageUrl(const String& url) {
   for (size_t i = 0; i < sizeof(kDeny) / sizeof(kDeny[0]); ++i) {
     if (low.indexOf(kDeny[i]) >= 0) return false;
   }
+  int q = low.indexOf('?');
+  String base = (q >= 0) ? low.substring(0, q) : low;
+  int scheme = base.indexOf("://");
+  if (scheme < 0) return false;
+  int pathStart = base.indexOf('/', scheme + 3);
+  String pathOnly;
+  if (pathStart < 0) {
+    pathOnly = "/";
+  } else {
+    pathOnly = base.substring(pathStart);
+  }
+  while (pathOnly.length() > 1 && pathOnly.endsWith("/")) {
+    pathOnly = pathOnly.substring(0, pathOnly.length() - 1);
+  }
+  if (pathOnly.length() == 0 || pathOnly == "/") return false;
   return true;
 }
 
@@ -1748,6 +1824,13 @@ static void handleCoverArt(const char* title) {
     }
 
     if (currentSong.length() > 5 && !currentSong.startsWith("[")) {
+      // [FIX] ПРИОРИТЕТ 1: пользовательские обложки из папки station_covers
+      if (haveStationCover) {
+        currentCoverUrl = manualCoverUrl;
+        updateDisplayCover();
+        return;
+      }
+      
       String coverSearchTitle = normalizeTitleForCoverSearch(currentSong);
       String currentSongLower = currentSong;
       currentSongLower.toLowerCase();
@@ -2087,7 +2170,8 @@ void Config::init() {
     bool needSave = false;
     
     // Дополнительная проверка на мусор trackFactsCount
-    if(store.trackFactsCount==0 || store.trackFactsCount > 3) {
+    if (store.trackFactsCount == 0 ||
+        store.trackFactsCount > TRACKFACTS_CONFIG_COUNT_MAX) {
       store.trackFactsCount = 1;
       needSave = true;
     }
@@ -2111,28 +2195,52 @@ void Config::init() {
   
   store.play_mode = store.play_mode & 0b11;
   if(store.play_mode>1) store.play_mode=PM_WEB;
+  // Валидация источника URL-плейлиста (WEB/DLNA) после чтения EEPROM.
+  // Если в памяти мусор или значение вне диапазона, безопасно возвращаем WEB.
+  if (store.playlistSource > PL_SRC_DLNA) store.playlistSource = PL_SRC_WEB;
+  // lastDlnaStation хранит 1-based индекс, ноль считаем неинициализированным состоянием.
+  if (store.lastDlnaStation == 0) store.lastDlnaStation = 1;
   _initHW();
   
   // Монтируем файловую систему LittleFS.
   // На ESP32-S3 иногда требуется несколько попыток монтирования.
   // Метка раздела "spiffs" берётся из partitions.csv.
   littleFsReady = false;
+  // Метка раздела совпадает с первым полем в partitions.csv (строка раздела данных ФС).
   const char* partLabel = "spiffs";
   for (int attempt = 0; attempt < 3 && !littleFsReady; ++attempt) {
-    bool doFormat = (attempt == 2); // на третьей попытке форматируем
+    // На третьей попытке форматируем раздел (после битой заливки образа / неверного offset при upload).
+    bool doFormat = (attempt == 2);
     if (LittleFS.begin(doFormat, "/littlefs", 10, partLabel)) {
-      if (LittleFS.totalBytes() > 0) {
+      // Основной признак «ФС жива»: ненулевой размер раздела.
+      size_t tbytes = LittleFS.totalBytes();
+      bool fsLooksOk = (tbytes > 0);
+      // Запасной тест: на редких связках core totalBytes() давал 0 при рабочей ФС — пробуем открыть известный файл.
+      if (!fsLooksOk) {
+        File probe = LittleFS.open("/www/theme.css", "r");
+        if (probe) {
+          fsLooksOk = true;
+          probe.close();
+          Serial.println("[LittleFS] totalBytes==0, но /www/theme.css открывается — считаем ФС валидной");
+        }
+      }
+      if (fsLooksOk) {
         littleFsReady = true;
+        Serial.printf("[LittleFS] OK attempt=%d format=%d total=%u used=%u\n",
+                      attempt, doFormat ? 1 : 0, (unsigned)tbytes, (unsigned)LittleFS.usedBytes());
       } else {
+        Serial.printf("[LittleFS] begin OK, но ФС пуста/бита (total=%u) — end() и повтор\n", (unsigned)tbytes);
         LittleFS.end();
       }
     } else {
+      Serial.printf("[LittleFS] begin failed attempt=%d format=%d (проверьте образ LittleFS и адрес заливки)\n",
+                    attempt, doFormat ? 1 : 0);
       delay(1000);
     }
   }
 
   if (!littleFsReady) {
-    BOOTLOG("FATAL: LittleFS mount failed! Check partitions.csv.");
+    BOOTLOG("FATAL: LittleFS mount failed! Check partitions.csv / FS upload offset / chip erase.");
     return;
   }
 
@@ -2221,6 +2329,20 @@ void Config::_setupVersion(){
     case 7:
       // [FIX SmartStart] Новое поле wasPlaying для разделения пользовательской настройки и флага состояния.
       saveValue(&store.wasPlaying, false);
+      break;
+    case 8:
+      // Этап A DLNA: добавляем базовые поля конфигурации и дефолтим их безопасными значениями.
+      saveValue(&store.playlistSource, (uint8_t)PL_SRC_WEB, false);
+      saveValue(&store.lastDlnaStation, (uint16_t)1, false);
+      saveValue(&store.lastPlayedSource, (uint8_t)PL_SRC_WEB, false);
+      saveValue(&store.dlnaIDX, (uint16_t)DLNA_IDX_DEFAULT, false);
+      saveValue(store.dlnaHost, DLNA_HOST_DEFAULT, sizeof(store.dlnaHost), false);
+      // Один commit на весь пакет миграции, чтобы не делать лишние циклы записи EEPROM.
+      EEPROM.commit();
+      break;
+    case 9:
+      // WebUI CPU bar: новое поле webCpuInfo — по умолчанию включено (как поведение до появления выключателя).
+      saveValue(&store.webCpuInfo, true);
       break;
     default:
       break;
@@ -2362,7 +2484,8 @@ void Config::changeMode(int newmode){
   initPlaylistMode();
   vTaskDelay(pdMS_TO_TICKS(5)); // даём core0 обработать очередь дисплея/веб после тяжёлого init
   // При переходе в SD шлём PR_PLAY_SD, чтобы плеер (Core 0) грузил из SD-плейлиста без гонки с getMode().
-  if (pir) player.sendCommand({(getMode()==PM_SDCARD) ? PR_PLAY_SD : PR_PLAY, getMode()==PM_WEB?store.lastStation:store.lastSdStation});
+  // Для WEB режима используем accessor lastStation(), чтобы корректно учитывать WEB/DLNA source.
+  if (pir) player.sendCommand({(getMode()==PM_SDCARD) ? PR_PLAY_SD : PR_PLAY, (getMode()==PM_WEB) ? lastStation() : store.lastSdStation});
   netserver.resetQueue();
   //netserver.requestOnChange(GETPLAYERMODE, 0);
   netserver.requestOnChange(GETINDEX, 0);
@@ -2548,6 +2671,9 @@ void Config::configPostPlaying(uint16_t stationId){
   if(getMode()==PM_SDCARD) {
     sdResumePos = 0;
     saveValue(&store.lastSdStation, stationId);
+  } else {
+    // В WEB-режиме сохраняем last station по активному источнику WEB/DLNA.
+    lastStation(stationId);
   }
   // [FIX SmartStart] Не трогаем smartstart — это пользовательская настройка (1=вкл, 2=выкл).
   // Вместо этого ставим wasPlaying=true: плеер сейчас играет → при перезагрузке можно автостартовать.
@@ -2628,11 +2754,13 @@ void Config::initPlaylistMode(){
       }
     }else{
       Serial.println("done");
-      _lastStation = store.lastStation;
+      // В WEB режиме восстанавливаем last station из активного источника (WEB/DLNA).
+      _lastStation = lastStation();
     }
   #else //ifdef USE_SD
     store.play_mode=PM_WEB;
-    _lastStation = store.lastStation;
+    // Без SD также учитываем активный WEB/DLNA источник.
+    _lastStation = lastStation();
   #endif
   if(getMode()==PM_WEB && !emptyFS) initPlaylist();
   log_i("%d" ,_lastStation);
@@ -2845,7 +2973,7 @@ void Config::setTrackFactsLang(uint8_t val){
 }
 
 void Config::setTrackFactsCount(uint8_t val){
-  if(val >= 1 && val <= 3) {
+  if (val >= 1 && val <= TRACKFACTS_CONFIG_COUNT_MAX) {
     saveValue(&store.trackFactsCount, val);
     Serial.printf("[setTrackFactsCount] Set to: %d\n", val);
   }
@@ -2903,6 +3031,7 @@ void Config::resetSystem(const char *val, uint8_t clientId){
     saveValue(&store.abuff, (uint16_t)(VS1053_CS==255?7:10), false);
     saveValue(&store.telnet, true);
     saveValue(&store.watchdog, true);
+    saveValue(&store.webCpuInfo, true, false);
     snprintf(store.mdnsname, MDNS_LENGTH, "yoradio-%x", (unsigned int)getChipId());
     saveValue(store.mdnsname, store.mdnsname, MDNS_LENGTH, true, true);
     display.putRequest(NEWMODE, CLEAR); display.putRequest(NEWMODE, PLAYER);
@@ -3050,6 +3179,14 @@ void Config::setDefaults() {
   // [FIX SmartStart] По умолчанию плеер не играл — автостарт запрещён
   store.wasPlaying = false;
   store.favOnly = false;
+  // Этап A DLNA: инициализация каркаса хранения источника и состояния DLNA.
+  store.playlistSource = (uint8_t)PL_SRC_WEB;
+  store.lastDlnaStation = 1;
+  store.lastPlayedSource = (uint8_t)PL_SRC_WEB;
+  memset(store.dlnaHost, 0, sizeof(store.dlnaHost));
+  strlcpy(store.dlnaHost, DLNA_HOST_DEFAULT, sizeof(store.dlnaHost));
+  store.dlnaIDX = (uint16_t)DLNA_IDX_DEFAULT;
+  store.webCpuInfo = true;
   eepromWrite(EEPROM_START, store);
 }
 
@@ -3107,8 +3244,10 @@ void Config::setBalance(int8_t balance) {
 }
 
 uint8_t Config::setLastStation(uint16_t val) {
+  // Сохраняем позицию в контекст текущего режима и playlistSource.
   lastStation(val);
-  return store.lastStation;
+  // Возвращаем актуальное значение через общий accessor.
+  return lastStation();
 }
 
 uint8_t Config::setCountStation(uint16_t val) {
@@ -3509,7 +3648,20 @@ void Config::indexSDPlaylistFromBuffer(const char* buf, size_t size) {
 
 void Config::initPlaylist() {
   //store.countStation = 0;
-  if (!LittleFS.exists(INDEX_PATH)) indexPlaylist();
+  // В SD-режиме плейлист инициализируется отдельными путями (initSDPlaylist и т.д.).
+  if (getMode() == PM_SDCARD) {
+    return;
+  }
+  // Для WEB/DLNA используем REAL_INDEX — иначе при PL_SRC_DLNA останется старый только WEB-индекс.
+  if (!LittleFS.exists(REAL_INDEX)) {
+#ifdef USE_DLNA
+    if (getPlaylistSource() == PL_SRC_DLNA) {
+      dlnaIndex.rebuildIndexFromPlaylist();
+      return;
+    }
+#endif
+    indexPlaylist();
+  }
 
   /*if (LittleFS.exists(INDEX_PATH)) {
     File index = LittleFS.open(INDEX_PATH, "r");

@@ -166,6 +166,14 @@ bool CommandHandler::exec(const char *command, const char *value, uint8_t cid) {
   if (strEquals(command, "sleeptimerstep")) { sleepTimerPlugin.cyclePreset(); return true; }
   if (strEquals(command, "sleeptimeralloff")) { sleepTimerPlugin.setAllOffEnabled(atoi(value) != 0); return true; }
   if (strEquals(command, "audioinfo")) { config.saveValue(&config.store.audioinfo, static_cast<bool>(atoi(value))); display.putRequest(AUDIOINFO); return true; }
+  // Команда с веб-настроек «CPU Info»: сохраняем флаг показа нижней полоски загрузки CPU в WebUI.
+  // Сама возможность полоски определяется при сборке (WEBUI_CPU_BAR_ENABLE в myoptions.h); здесь только пользовательское вкл/выкл.
+  // После сохранения рассылаем GETSYSTEM всем клиентам — чтобы страница плеера сразу скрыла/показала #cpubar без перезагрузки.
+  if (strEquals(command, "webcpuinfo")) {
+    config.saveValue(&config.store.webCpuInfo, static_cast<bool>(atoi(value)));
+    netserver.requestOnChange(GETSYSTEM, 0);
+    return true;
+  }
   if (strEquals(command, "vumeter"))   { config.saveValue(&config.store.vumeter, static_cast<bool>(atoi(value))); display.putRequest(SHOWVUMETER); return true; }
   if (strEquals(command, "softap"))    { config.saveValue(&config.store.softapdelay, static_cast<uint8_t>(atoi(value))); return true; }
   if (strEquals(command, "mdnsname"))  { config.saveValue(config.store.mdnsname, value, MDNS_LENGTH); return true; }
@@ -223,7 +231,7 @@ bool CommandHandler::exec(const char *command, const char *value, uint8_t cid) {
     // Если факт уже есть в RAM/файловом кэше — не спамим всплывающим "ожидание...".
     String rejectReason;
     if (trackFactsPlugin.requestManualFact(&rejectReason)) {
-      trackFactsPlugin.sendStatus("Запрос факта принят. Ожидание...");
+      trackFactsPlugin.sendStatus("Запрос принят, готовим текст о треке…");
     } else if (rejectReason.length() > 0 &&
                rejectReason.indexOf("уже доступен") < 0 &&
                rejectReason.indexOf("из файлового кэша") < 0 &&

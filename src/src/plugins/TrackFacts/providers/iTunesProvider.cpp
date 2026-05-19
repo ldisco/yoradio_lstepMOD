@@ -36,7 +36,9 @@ static String readLine(WiFiClientSecure& c, uint32_t timeoutMs) {
   return line;
 }
 
-FactResult iTunesProvider::fetchFact(const String& artist, const String& title) {
+FactResult iTunesProvider::fetchFact(const String& artist, const String& title,
+                                     const FactFetchContext* ctx) {
+  (void)ctx;
   FactResult result;
   result.success = false;
 

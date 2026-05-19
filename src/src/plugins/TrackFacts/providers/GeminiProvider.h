@@ -7,7 +7,8 @@
 
 class GeminiProvider : public FactProvider {
 public:
-  FactResult fetchFact(const String& artist, const String& title) override;
+  FactResult fetchFact(const String& artist, const String& title,
+                       const FactFetchContext* ctx) override;
   const char* name() const override { return "Gemini"; }
   bool needsApiKey() const override { return true; }
 };

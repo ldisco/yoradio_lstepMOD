@@ -51,9 +51,13 @@ rssi — уровень WiFi в dBm (слабее −70…−80 при фриз�
 // false - отключено (в вебе всегда logo)
 #define WEBUI_COVERS_ENABLE true
 
+// WebUI: нижняя полоска загрузки CPU (как полоса буфера). Расчёт — FreeRTOS run-time stats.
+// Раскомментируйте строку ниже, чтобы включить (в options.h по умолчанию 0).
+#define WEBUI_CPU_BAR_ENABLE 1
+
 // Логи блокировки SSL (cooldown/heap/SD и т.д.).
 // false - скрыть периодические сообщения в мониторе.
-#define SSL_BLOCK_LOG_ENABLE true
+#define SSL_BLOCK_LOG_ENABLE false
 
 // HTTPS: суммарный free heap + отдельно MIN_MAX_ALLOC_HEAP_FOR_SSL (см. options.h).
 // (-32512) при freeHeap 60–70K = фрагментация: смотреть getMaxAllocHeap в логах блокировки.
@@ -70,7 +74,7 @@ rssi — уровень WiFi в dBm (слабее −70…−80 при фриз�
 #define MIN_AUDIO_BUFFER_FOR_SSL_FACTS_PERCENT 6
 
 // Отображение обложек на дисплее (TFT).
-#define DISPLAY_COVERS_ENABLE true
+#define DISPLAY_COVERS_ENABLE false
 
 // 2000 мс как в options.h по умолчанию: при FLAC+Facts чуть больше времени до TLS обложки после старта потока.
 #define COVER_DOWNLOAD_DELAY_MS 2000
@@ -78,9 +82,21 @@ rssi — уровень WiFi в dBm (слабее −70…−80 при фриз�
 
 // Лимиты файлового кэша обложек/фактов.
 // Если оставить как есть или удалить строки, сработают дефолты из options.h/TrackFacts.h.
-#define COVER_CACHE_MAX_BYTES (5 * 1024 * 1024)
+#define COVER_CACHE_MAX_BYTES (2 * 1024 * 1024)
 // #define LITTLEFS_MIN_FREE_BYTES (2 * 1024 * 1024)
 #define FACTS_CACHE_MAX_BYTES (2 * 1024 * 1024) // Сейчас задаётся в TrackFacts.h
+// TrackFacts: верхняя граница количества фактов, которое может запросить движок за один трек.
+// Этот лимит нужен для внутренних циклов плагина и защищает от чрезмерного числа последовательных SSL-запросов.
+// Значение 5 оставлено как безопасный технологический потолок для итеративных AI-провайдеров.
+#ifndef TRACKFACTS_MAX_PER_TRACK
+#define TRACKFACTS_MAX_PER_TRACK 5
+#endif
+// TrackFacts: лимит значения, сохраняемого в конфиге (EEPROM/WebUI) для trackFactsCount.
+// Именно этот макрос используется в config.cpp/main.cpp при валидации сохранённого значения.
+// Значение 3 соответствует текущей логике интерфейса и предотвращает ошибку компиляции "not declared".
+#ifndef TRACKFACTS_CONFIG_COUNT_MAX
+#define TRACKFACTS_CONFIG_COUNT_MAX 3
+#endif
 
 // Жёсткое окно блокировки SSL после переключения станции (мс).
 // Выведено в myoptions для удобства тюнинга; текущее дефолтное значение 20000.
@@ -111,8 +127,8 @@ rssi — уровень WiFi в dBm (слабее −70…−80 при фриз�
 // Если ES9038 не используется, пины устанавливаются в 255 (не назначены),
 // что позволяет использовать эти GPIO для других целей.
 #if USE_ES9038_DAC
-  #define EQ_SDA_PIN 16  // Подключение к GPIO16
-  #define EQ_SCL_PIN 15  // Подключение к GPIO15
+  #define EQ_SDA_PIN 16  //
+  #define EQ_SCL_PIN 15  // 
 #else
   #define EQ_SDA_PIN 255
   #define EQ_SCL_PIN 255
@@ -123,7 +139,7 @@ rssi — уровень WiFi в dBm (слабее −70…−80 при фриз�
 // Закомментируйте для отключения защиты паролем.
 #define FM_PASSWORD "Adm1nUp2"
 
-/* TrackFacts MusicBrainz Relay */
+/* TrackFacts MusicBrainz Relay (v0.3.23) */
 #define TF_MB_RELAY_IP   "_._._._"  /* Your VPS IP */
 #define TF_MB_RELAY_PORT 4444            /* Your socat port */
 
@@ -133,10 +149,10 @@ rssi — уровень WiFi в dBm (слабее −70…−80 при фриз�
 //#define DSP_MODEL    DSP_ST7735  /* Select ST7735*/
 //#define DTYPE     INITR_GREENTAB  /*  ST7735 display submodel. По умолчанию "INITR_BLACKTAB" */
 //#define DSP_MODEL    DSP_ILI9341 /* Select ILI9341*/
-//#define DSP_MODEL   DSP_ST7789  /* Select ST7789*/
+#define DSP_MODEL   DSP_ST7789  /* Select ST7789*/
 //#define DSP_MODEL   DSP_ST7789_170  /* Select ST7789x170*/
-#define DSP_MODEL    DSP_ILI9488 /* Select ILI9488*/
-#define ILI9488_PORTRAIT true
+//#define DSP_MODEL    DSP_ILI9488 /* Select ILI9488*/
+//#define ILI9488_PORTRAIT true
 //#define DSP_MODEL    DSP_ST7796 /* Select ILI9486*/
 //#define DSP_MODEL    DSP_SSD1306x32    /* Select SSD1306-128х32*/
 //#define DSP_MODEL    DSP_SH1106    /* Select SH1106-128х64*/
@@ -212,9 +228,9 @@ rssi — уровень WiFi в dBm (слабее −70…−80 при фриз�
 /* **************************************** */
 
 /*  ENCODERs  */
-#define ENC_BTNL              4       /*  Левое вращение энкодера (S1, DT)*/
-#define ENC_BTNR              5       /*  Правое вращение энкодера (S2, CLK) */
-#define ENC_BTNB              8       /*  Кнопка энкодера (Key, SW)*/
+//#define ENC_BTNL              4       /*  Левое вращение энкодера (S1, DT)*/
+//#define ENC_BTNR              5       /*  Правое вращение энкодера (S2, CLK) */
+//#define ENC_BTNB              8       /*  Кнопка энкодера (Key, SW)*/
 //#define ENC2_BTNL             6       /*  Левое вращение энкодера-2 (S1, DT)*/
 //#define ENC2_BTNR             5       /*  Правое вращение энкодера-2 (S2, CLK) */
 //#define ENC2_BTNB             4       /*  Кнопка энкодера-2 (Key, SW)*/
@@ -224,11 +240,11 @@ rssi — уровень WiFi в dBm (слабее −70…−80 при фриз�
 
 /*  SDCARD  */
 #define SD_MAX_LEVELS      6     /* Глубина рекурсии по папкам SD (оригинал: 3) */
-// #define SDC_CS          39      /* SDCARD CS pin */
+#define SDC_CS          39      /* SDCARD CS pin */
 					// Connect SDC_MOSI to  40  /* On board can be D1 pin */
 					// Connect SDC_SCK to   41   /* On board can be CLK pin */
 					// Connect SDC_MISO to  42  /* On board can be D0 pin */
-// #define SD_SPIPINS  41, 42, 40    /* SCK, MISO, MOSI */
+#define SD_SPIPINS  41, 42, 40    /* SCK, MISO, MOSI */
 ////#define SDC_CS        10        /* SDCARD CS pin */
 ////#define SD_SPIPINS  12, 13, 11      /* SCK, MISO, MOSI */
 ////#define SD_HSPI     true      /* use HSPI for SD (miso=12, mosi=13, clk=14) instead of VSPI (by default)  */
@@ -271,7 +287,7 @@ rssi — уровень WiFi в dBm (слабее −70…−80 при фриз�
 //#define HIDE_VOLPAGE       /* Скрыть страницу "Громкость", ориентируемся по прогрессбару. (МОД nva_lw и Maleksm)  */
 //#define HIDE_DATE            /* Скрыть дату. (МОД nva_lw и Maleksm)  */
 //#define BOOMBOX_STYLE     /*  Разные варианты "показометра" VUmetr. Столбик, если строку закоментировать. */
-//#define WAKE_PIN              255
+#define WAKE_PIN            4
 
 //#define AUTOBACKLIGHT(x)    *function*    /*  Autobacklight function. See options.h for exsample  */
 //#define AUTOBACKLIGHT_MAX     2500
@@ -291,8 +307,8 @@ rssi — уровень WiFi в dBm (слабее −70…−80 при фриз�
 //#define GRND_HEIGHT     231     /* (231 м) Высота местности над уровнем моря в метрах для поправки в давление */
 
 /*  IR control  */
-////#define IR_PIN            4
-////#define IR_TIMEOUT        80              /*  see kTimeout description in IRremoteESP8266 example */
+#define IR_PIN            4
+#define IR_TIMEOUT        80              /*  see kTimeout description in IRremoteESP8266 example */
                    /*  https://github.com/crankyoldgit/IRremoteESP8266/blob/master/examples/IRrecvDumpV2/IRrecvDumpV2.ino */
 /******************************************/
 

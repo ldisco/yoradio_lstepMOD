@@ -10,7 +10,7 @@ static inline void appendGroup(char *buf, size_t bufSize, const char *name) {
 
 // PLAYLIST_UPDATED = только разослать плейлист клиентам (без перестройки индекса). Используется после setFavorite.
 // PLAYLISTSAVED = перестроить индекс + разослать плейлист (импорт/полное сохранение плейлиста).
-enum requestType_e : uint8_t  { PLAYLIST=1, STATION=2, STATIONNAME=3, ITEM=4, TITLE=5, VOLUME=6, NRSSI=7, BITRATE=8, MODE=9, EQUALIZER=10, BALANCE=11, PLAYLISTSAVED=12, STARTUP=13, GETINDEX=14, GETACTIVE=15, GETSYSTEM=16, GETSCREEN=17, GETTIMEZONE=18, GETWEATHER=19, GETCONTROLS=20, DSPON=21, SDPOS=22, SDLEN=23, SDSNUFFLE=24, SDINIT=25, GETPLAYERMODE=26, CHANGEMODE=27, GETTRACKFACTS=28, SDINDEXING=29, PLAYLIST_UPDATED=30 };
+enum requestType_e : uint8_t  { PLAYLIST=1, STATION=2, STATIONNAME=3, ITEM=4, TITLE=5, VOLUME=6, NRSSI=7, BITRATE=8, MODE=9, EQUALIZER=10, BALANCE=11, PLAYLISTSAVED=12, STARTUP=13, GETINDEX=14, GETACTIVE=15, GETSYSTEM=16, GETSCREEN=17, GETTIMEZONE=18, GETWEATHER=19, GETCONTROLS=20, DSPON=21, SDPOS=22, SDLEN=23, SDSNUFFLE=24, SDINIT=25, GETPLAYERMODE=26, CHANGEMODE=27, GETTRACKFACTS=28, SDINDEXING=29, PLAYLIST_UPDATED=30, PLAYLISTSRC_DLNA=31, PLAYLISTSRC_WEB=32 };
 enum import_e      : uint8_t  { IMDONE=0, IMPL=1, IMWIFI=2 };
 const char emptyfs_html[] PROGMEM = R"(
 <!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=0.25"><meta charset="UTF-8">
@@ -99,16 +99,17 @@ const char index_html[] PROGMEM = R"(
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <link rel="icon" type="image/png" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAMAAACdt4HsAAAAYFBMVEUAAADYw1PcyVjYxFTaxlXYxFTbx1bcyVjZxVXbyFfcyFfaxlbax1bcyVjcyVjbyFfbyFfZxVXaxlbbx1fcyFjcyVjbx1fZxVXcyFjcyVjax1bbyFfcyVjbyFfax1bWwVKMlHGzAAAAH3RSTlMA+wv0zu6dBeVqSryjMRaCU97Fjz8liNk5HbFdDnWsEHoUsAAAAeFJREFUWMPtlllyrDAMRS1P2NjMQzc9RPvf5Ut1IPYjDRbJR1KVnD8Z7i1ZsgXsh1JW3usrC9Ta+2og620DiCjaaY65U4AIpqLqBb7R3B5xJucYRpI+U7jgHwsVLgjSLu74DmSvMTdhQVMMHAYeBhiQFAO5Y3CiGFzWBhDilmKQ4zsqm5uwQGvkCRfsytFkJIOhWWo+vz8uCfWMRqEVAJwsn+PsKgFA+YJR4UWe50Oc1Gt8vrFfyGC19153+afUvVMA+ADAaH5QXhvA/wB3yEICfgAqsvys8BngiPor4AaSpM8BN7lQRrrAbcBSLvMeKqmvVhtYh8mxqjCi7Tnnk4YDKYzRy9DPA2Uy9CoYDBShsCrKitxCnUUnm7qHFwyUYTlOAXYHWxP0TTzBbm1UBGIPfMkDZRcMur1bFPdAxEQPXhI1TNLSj+HxK9l9u8H41RrcKQZub5THbdxA7M3WAZL/EvRp0PDPGEgM9CxBqo9mYMcpAAPyzNZMx2aysUUWzYSi7lzSwALGGG3rvO/zurajM4BQJh0aXAGglACYg2v6uw64h2ZJfOIcp2lxh4ZgkEncRjAKF8AtYCI53M2mQc1IlNrAM7lyZ0akHKURsVaokxuLYxfD6ot8w+nOFuyP5/wDsZKME0E1GogAAAAASUVORK5CYII=">
   <link rel="stylesheet" href="theme.css" type="text/css" />
-  <link rel="stylesheet" href="style.css?v=2" type="text/css" />
+  <link rel="stylesheet" href="style.css?v=5" type="text/css" />
   <script type="text/javascript" src="variables.js"></script>
-  <script type="text/javascript" src="script.js?v=2"></script>
-  <script type="text/javascript" src="dragpl.js?v=2"></script>
+  <script type="text/javascript" src="script.js?v=14"></script>
+  <script type="text/javascript" src="dragpl.js?v=4"></script>
   </head>
 <body>
 <div id="content" class="hidden progmem">
 </div><!--content-->
 <div id="progress"><span id="loader"></span></div>
 <div id="heap"></div>
+<div id="cpubar" class="hidden"></div>
 </body>
 </html>
 )";

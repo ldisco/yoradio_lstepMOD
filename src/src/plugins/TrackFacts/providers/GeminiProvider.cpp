@@ -18,7 +18,8 @@ extern bool isSafeForSSLForFacts();
 // ============================================================================
 // Запрос факта к Google Gemini AI
 // ============================================================================
-FactResult GeminiProvider::fetchFact(const String& artist, const String& title) {
+FactResult GeminiProvider::fetchFact(const String& artist, const String& title,
+                                       const FactFetchContext* ctx) {
   FactResult result;
   result.success = false;
 
@@ -45,21 +46,13 @@ FactResult GeminiProvider::fetchFact(const String& artist, const String& title) 
   String url = "https://generativelanguage.googleapis.com/v1beta/models/" +
                String(GEMINI_MODEL) + ":generateContent?key=" + _apiKey;
 
-  // Формирование промпта на нужном языке
-  String langInstruction;
-  if (_language == ProviderLanguage::RUSSIAN) {
-    langInstruction = "На русском языке";
-  } else if (_language == ProviderLanguage::ENGLISH) {
-    langInstruction = "In English";
-  } else {
-    langInstruction = "In Russian"; // AUTO -> русский по умолчанию
-  }
-
-  String prompt = langInstruction + ", напиши короткий интересный факт (17-20 слов) про музыкальную композицию: \"" +
-                  artist + " - " + title + "\". Факт должен быть информативным и увлекательным, без вводных фраз.";
+  String prompt = makeMusicFactUserPrompt(artist, title, ctx);
 
   // Подготовка JSON-запроса для Gemini API (v1beta)
   JsonDocument requestDoc;
+  const bool iterative =
+      ctx && ctx->factTotal >= 2 && ctx->factIndex1 > 1;
+  requestDoc["generationConfig"]["temperature"] = iterative ? 0.55 : 0.35;
   JsonArray contents = requestDoc["contents"].to<JsonArray>();
   JsonObject content = contents.add<JsonObject>();
   JsonArray parts = content["parts"].to<JsonArray>();

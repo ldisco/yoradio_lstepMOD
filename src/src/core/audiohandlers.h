@@ -116,6 +116,15 @@ void audio_info(const char *info) {
   if (strstr(info, "format is mp3")  != NULL) { g_audioFormatFlacActive = false; config.setBitrateFormat(BF_MP3); display.putRequest(DBITRATE); netserver.requestOnChange(BITRATE, 0); }
   if (strstr(info, "format is wav")  != NULL) { g_audioFormatFlacActive = false; config.setBitrateFormat(BF_WAV); display.putRequest(DBITRATE); netserver.requestOnChange(BITRATE, 0); }
   if (strstr(info, "format is ogg")  != NULL) { g_audioFormatFlacActive = false; config.setBitrateFormat(BF_OGG); display.putRequest(DBITRATE); netserver.requestOnChange(BITRATE, 0); }
+  // Битрейт обрабатываем до проверки lockOutput:
+  // на ряде потоков событие "BitRate: ..." приходит только в начале соединения,
+  // и если в этот момент lockOutput=true, UI навсегда остаётся с 0 kBits.
+  /*char* iciEarly;
+  char bEarly[20] = {0};
+  if ((iciEarly = strstr(info, "BitRate: ")) != NULL) {
+    strlcpy(bEarly, iciEarly + 9, sizeof(bEarly)); // Ограничиваем копирование размером буфера.
+    audio_bitrate(bEarly);
+  }*/
 
   if(player.lockOutput) return;
   // [FIX] Сообщения восстановления декодера не выводим в лог (Serial блокирует → фризы), но обработку (формат, BitRate для UI) оставляем.

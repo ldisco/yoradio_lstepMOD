@@ -41,6 +41,13 @@ FsInfo fsInfoPlugin;
 extern __attribute__((weak)) void yoradio_on_setup();
 extern volatile bool g_sleepTimerShutdown; // Глобальный флаг отключения по таймеру сна.
 
+// Счётчик авто-перезапусков при сбое монтирования LittleFS на холодном пуске.
+// RTC_DATA_ATTR: значение сохраняется при ESP.restart(), обнуляется при полном снятии питания.
+// Нужен, чтобы не зависать в while(true), но дать ФС несколько шансов «проснуться» после
+// костыля ES9038 (SW-restart сразу после POWERON часто даёт ложный fail LittleFS.begin).
+RTC_DATA_ATTR static uint8_t g_littleFsBootRetryCount = 0;
+#define LITTLEFS_BOOT_RETRY_MAX  3  // Максимум подряд ESP.restart() до продолжения setup без hang
+
 // [FIX] Задача плеера на core 0: при блокировке потока (реконнект, парсинг и т.д.) блокируется только она,
 // главный цикл (core 1) продолжает работать — веб и тач отзывчивы, пользователь может остановить/сменить станцию.
 #define PLAYER_TASK_STACK  12288
@@ -151,7 +158,27 @@ void setup() {
   // 1. Инициализируем конфигурацию и LittleFS ПЕРВЫМИ
   config.init();
   delay(100);  // Короткая стабилизация после config.init()
-  
+
+  // LittleFS не смонтировалась: вместо бесконечного hang — ограниченные авто-перезапуски (как «костыль» 0.8.142).
+  // После LITTLEFS_BOOT_RETRY_MAX попыток продолжаем setup с предупреждением (веб/радио могут работать частично).
+  if (!littleFsReady) {
+    if (g_littleFsBootRetryCount < LITTLEFS_BOOT_RETRY_MAX) {
+      ++g_littleFsBootRetryCount;
+      Serial.printf("##[BOOT]# LittleFS not ready — auto-restart %u/%u (RTC retry)\n",
+                    (unsigned)g_littleFsBootRetryCount, (unsigned)LITTLEFS_BOOT_RETRY_MAX);
+      delay(500);  // Короткая пауза перед рестартом — даём питанию/SPI-flash стабилизироваться
+      ESP.restart();
+    }
+  } else {
+    // Успешное монтирование — сбрасываем счётчик, чтобы следующий обычный рестарт не тратил попытки
+    g_littleFsBootRetryCount = 0;
+  }
+  if (!littleFsReady) {
+    // Исчерпали попытки или это редкий случай реально битой ФС — не вешаем устройство, только предупреждаем
+    g_littleFsBootRetryCount = 0;
+    Serial.println("##[WARN]## littleFsReady==0 after retries; setup continues. Re-flash LittleFS if problems persist.");
+  }
+
   if (yoradio_on_setup) yoradio_on_setup();
   
   // 2. Инициализируем плагины (теперь LittleFS точно готов)
@@ -164,7 +191,7 @@ void setup() {
   trackFactsPlugin.setLanguage(static_cast<FactLanguage>(config.store.trackFactsLang));
   // Если count=0 или мусор, устанавливаем по умолчанию 1
   uint8_t factCount = config.store.trackFactsCount;
-  if(factCount == 0 || factCount > 5) factCount = 1;
+  if (factCount == 0 || factCount > TRACKFACTS_CONFIG_COUNT_MAX) factCount = 1;
   trackFactsPlugin.setFactCount(factCount);
   // Провайдер из конфига (failover на iTunes если нужен ключ но его нет - в checkFailover)
   uint8_t provider = config.store.trackFactsProvider;
@@ -324,8 +351,8 @@ void loop() {
         lastRetryMs = now;
         retryCount++;
         if (retryCount == 3) {
-          // После трёх неудачных попыток считаем, что мог «залипнуть» WiFi/DNS.
-          // Выполняем мягкий перезапуск WiFi без стирания сохранённых сетей:
+          // после 3 неудачных авто-ретраев мягко перезапускаем WiFi-стек.
+          // Это повышает шанс восстановиться после помех/залипания WiFi без power-cycle.
           Serial.println("[RETRY] 3 fails in a row, restarting WiFi stack");
           WiFi.disconnect(false);
           delay(100);
@@ -333,7 +360,7 @@ void loop() {
         }
         if (retryCount <= 5) {
           Serial.printf("[RETRY] Auto-retry #%d, delay was %lu ms\n", retryCount, delayMs);
-          player.sendCommand({PR_PLAY, config.lastStation()});
+          player.sendCommand({PR_PLAY, -((int)config.lastStation())});
         } else {
           Serial.println("[RETRY] Сдаёмся после 5 попыток");
           // ВАЖНО: не отключаем SmartStart автоматически.

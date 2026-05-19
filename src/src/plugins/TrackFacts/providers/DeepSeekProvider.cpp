@@ -15,7 +15,8 @@ extern bool isSafeForSSLForFacts();
 // ============================================================================
 // Запрос факта к DeepSeek AI
 // ============================================================================
-FactResult DeepSeekProvider::fetchFact(const String& artist, const String& title) {
+FactResult DeepSeekProvider::fetchFact(const String& artist, const String& title,
+                                       const FactFetchContext* ctx) {
   FactResult result;
   result.success = false;
 
@@ -40,27 +41,22 @@ FactResult DeepSeekProvider::fetchFact(const String& artist, const String& title
 
   String url = "https://api.deepseek.com/chat/completions";
 
-  // Формирование промпта на нужном языке
-  String langInstruction;
-  if (_language == ProviderLanguage::RUSSIAN) {
-    langInstruction = "На русском языке";
-  } else if (_language == ProviderLanguage::ENGLISH) {
-    langInstruction = "In English";
-  } else {
-    langInstruction = "In Russian"; // AUTO -> русский по умолчанию
-  }
-
-  String prompt = langInstruction + ", напиши короткий интересный факт (17-20 слов) про музыкальную композицию: \"" +
-                  artist + " - " + title + "\". Факт должен быть информативным и увлекательным, без вводных фраз.";
+  String prompt = makeMusicFactUserPrompt(artist, title, ctx);
 
   // Формирование JSON-запроса в стиле OpenAI API
   JsonDocument requestDoc;
   requestDoc["model"] = "deepseek-chat";
+  const bool iterative =
+      ctx && ctx->factTotal >= 2 && ctx->factIndex1 > 1;
+  requestDoc["temperature"] = iterative ? 0.55 : 0.35;
 
   JsonArray messages = requestDoc["messages"].to<JsonArray>();
   JsonObject systemMsg = messages.add<JsonObject>();
   systemMsg["role"] = "system";
-  systemMsg["content"] = "You are a helpful music expert.";
+  systemMsg["content"] =
+      "You assist with brief music trivia. Reply only with verifiable, source-plausible information; "
+      "never invent instruments, genres, charts, or session details. If uncertain for this exact "
+      "track, say clearly that reliable public information is sparse.";
 
   JsonObject userMsg = messages.add<JsonObject>();
   userMsg["role"] = "user";

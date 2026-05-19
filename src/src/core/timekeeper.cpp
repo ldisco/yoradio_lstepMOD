@@ -106,11 +106,9 @@ bool TimeKeeper::loop0(){ // core0 (display)
     //HEAP_INFO();
   }
 
-  // [FIX] Проверка зависания главного цикла.
-  // Перезагрузка ТОЛЬКО если main loop не обновлялся >60 с И аудио-стрим тоже мёртв.
-  // Если стрим активен (g_lastWebStreamActivityMs свежий), значит устройство работает,
-  // а main loop просто заблокирован на lwIP-мьютексе из-за параллельного SSL-запроса —
-  // это временная ситуация, и перезагрузка только ухудшит UX.
+  // [FIX] Проверка зависания главного цикла (возврат к более живучему recovery-подходу).
+  // Условие срабатывания: Wi-Fi подключен, main loop и веб-стрим "молчат" долго.
+  // Порог установлен в 30 секунд (вместо 60/90), чтобы быстрее выходить из "мертвого" состояния.
   static uint32_t _lastFreezeCheckMs = 0;
   static uint32_t _lastFreezeRecoveryMs = 0;
   if (currentTime - _lastFreezeCheckMs >= 15000) {
@@ -118,8 +116,8 @@ bool TimeKeeper::loop0(){ // core0 (display)
     uint32_t loopAge = currentTime - g_mainLoopHeartbeatMs;
     uint32_t streamAge = currentTime - g_lastWebStreamActivityMs;
     if (WiFi.status() == WL_CONNECTED &&
-        loopAge > 60000 &&
-        streamAge > 60000 &&
+        loopAge > 30000 &&
+        streamAge > 30000 &&
         (currentTime - _lastFreezeRecoveryMs) > 120000) {
       _lastFreezeRecoveryMs = currentTime;
       Serial.printf("[FREEZE-RECOVERY] Main loop stuck %lus, stream silent %lus — rebooting\n",
@@ -289,8 +287,8 @@ void TimeKeeper::_doWatchDog(){
   // успешный рестарт обновит g_lastWebStreamActivityMs через audio_stream_activity().
   g_lastWebStreamActivityMs = now;
 
-  // Перезапускаем текущую станцию (аналогично ручному старту).
-  player.sendCommand({PR_PLAY, (int)st});
+  // Перезапускаем текущую станцию как retry‑запрос.
+  player.sendCommand({PR_PLAY, -((int)st)});
 }
 
 void TimeKeeper::_upRSSI(){

@@ -34,7 +34,7 @@ document.addEventListener("drop", ({target}) => {
 		}
 		let items=document.getElementById('pleditorcontent').getElementsByTagName('li');
 		for (let i = 0; i <= items.length-1; i++) {
-			items[i].getElementsByTagName('span')[0].innerText=("00"+(i+1)).slice(-3);
+			items[i].getElementsByTagName('span')[0].innerText=String(i+1).padStart(3, '0');
 		}
 	}
 });

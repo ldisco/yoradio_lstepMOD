@@ -16,13 +16,14 @@
         <section class="group group_system hidden" id="group_system">
           <div class="title"><span>system</span></div>
           <div class="reset" data-name="system" title="reset"></div>
-          <div class="flex-row">
+          <!-- Сетка 2×2: правая колонка фиксирована; VU — строка на всю ширину (webui-system-vu-fullwidth). -->
+          <div class="webui-system-switch-matrix">
             <div class="checkbox" id="sst" data-command="smartstart" data-tip="Автозапуск воспроизведения после включения устройства"><div class="knob"></div>Smart Start</div>
             <div class="checkbox" id="aif" data-command="audioinfo" data-tip="Отображение полосы буфера на экране"><div class="knob"></div>Audio Info</div>
-            <div class="checkbox group group_vu hidden" id="vu" data-command="vumeter" data-tip="Показывать VU-метр громкости на экране устройства"><div class="knob"></div>VU meter</div>
-          </div>
-          <div class="flex-row">
             <div class="checkbox hidden" id="stao" data-command="sleeptimeralloff" data-tip="Полное отключение питания по таймеру. Требует пин управления питанием (SLEEP_TIMER_PIN). Без SLEEP_TIMER_PIN — простая остановка плеера"><div class="knob"></div>Sleep timer ALL OFF</div>
+            <!-- CPU Info: видимость с прошивки (WEBUI_CPU_BAR_ENABLE → webcpu в getsystem); webui-cpuinfo-toggle — маркер для скрипта -->
+            <div class="checkbox hidden webui-cpuinfo-toggle" id="wci" data-command="webcpuinfo" data-tip="Полоска загрузки CPU внизу веб-плеера (только если функция собрана в прошивке)"><div class="knob"></div>CPU Info</div>
+            <div class="checkbox group group_vu hidden webui-system-vu-fullwidth" id="vu" data-command="vumeter" data-tip="Показывать VU-метр громкости на экране устройства"><div class="knob"></div>VU meter</div>
           </div>
           <div class="flex-row">
             <div class="inputwrap">
@@ -294,7 +295,7 @@
                 <option value="1">DeepSeek AI</option>
                 <option value="2">iTunes Search (Default)</option>
                 <option value="3">Last.fm (Relay)</option>
-                <option value="4">MusicBrainz (Relay)</option>
+                <option value="4">Groq (groq.com, не xAI Grok)</option>
               </select>
             </div>
           </div>
@@ -315,7 +316,7 @@
             </div>
             <div class="inputwrap">
               <span class="inputtitle">facts per track</span>
-              <input type="number" id="tfcount" data-command="trackfactscount" value="3" min="1" max="5" step="1" />
+              <input type="number" id="tfcount" data-command="trackfactscount" value="3" min="1" max="3" step="1" />
             </div>
           </div>
           <div class="flex-row last">

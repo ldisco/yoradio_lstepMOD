@@ -101,6 +101,7 @@ void Player::setError(const char *e){
 
 void Player::_stop(bool alreadyStopped){
   log_i("%s called", __func__);
+  if(!alreadyStopped) _hasError = false; // [FIX] Сбрасываем ошибку при ручной остановке, чтобы показать "[остановлено]"
   if(config.getMode()==PM_SDCARD && !alreadyStopped) config.sdResumePos = player.getFilePos();
   _status = STOPPED;
   setOutputPins(false);
@@ -167,10 +168,19 @@ void Player::loop() {
     switch (requestP.type){
       case PR_STOP: _stop(); break;
       case PR_PLAY: {
-        if (requestP.payload>0) {
+        const bool isAutoRetry = requestP.payload < 0;
+        const uint16_t requestedStation = (uint16_t)abs(requestP.payload);
+        if (isAutoRetry && requestedStation != config.lastStation()) {
+          if (config.store.audioinfo) {
+            Serial.printf("[RETRY] Skip stale retry station %u, current is %u\n",
+                          (unsigned)requestedStation, (unsigned)config.lastStation());
+          }
+          break;
+        }
+        if (requestP.payload > 0) {
           config.setLastStation((uint16_t)requestP.payload);
         }
-        _play((uint16_t)abs(requestP.payload), false);
+        _play(requestedStation, false);
         if (player_on_station_change) player_on_station_change();
         pluginsManager::getInstance().on_station_change();
         break;

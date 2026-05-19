@@ -1,6 +1,6 @@
 // TrackFacts.cpp - Плагин для получения интересных фактов о песнях
-// v0.4.1 - iTunes по умолчанию (pos 2), MusicBrainz (pos 4)
-// Ограничение повторных запросов для metadata-провайдеров. Max 3 факта.
+// Слот провайдера 4 — Groq (OpenAI-совместимый API)
+// Ограничение повторных запросов для metadata-провайдеров (потолок — TRACKFACTS_MAX_PER_TRACK).
 // Принцип: "Собрал факт -> сохранил в файл -> забыл. Нужно показать -> прочитал файл."
 #include "TrackFacts.h"
 #include <Arduino.h>
@@ -10,10 +10,16 @@
 #include "../../core/netserver.h" // [v0.4.4] Для доступа к AsyncWebSocket websocket
 #include "../../../myoptions.h" // [v0.3.23] Подключаем настройки прокси
 
+#ifndef TRACKFACTS_AUTO_FETCH_ENABLE
+// true — фоновый запрос при смене трека (iTunes/Last.fm и т.д.).
+// false — сеть только по нажатию на обложку/лого в плеере (картинка альбома качается как раньше).
+#define TRACKFACTS_AUTO_FETCH_ENABLE true
+#endif
+
 // [v0.4.0] Подключаем все провайдеры
 #include "providers/GeminiProvider.h"
 #include "providers/DeepSeekProvider.h"
-#include "providers/MusicBrainzProvider.h"
+#include "providers/GroqProvider.h"
 #include "providers/LastFmProvider.h"
 #include "providers/iTunesProvider.h"
 
@@ -25,6 +31,14 @@
   #define TRACKFACTS_AUTO_DEEPSEEK_ENABLE true
 #endif
 
+#ifndef TRACKFACTS_AUTO_GROQ_ENABLE
+  #define TRACKFACTS_AUTO_GROQ_ENABLE true
+#endif
+
+#ifndef TRACKFACTS_MAX_PER_TRACK
+  #define TRACKFACTS_MAX_PER_TRACK 5
+#endif
+
 // Внешние ссылки на метаданные из конфигурации плеера
 extern String metaTitle;
 extern String metaArtist;
@@ -32,6 +46,29 @@ extern String currentFact;
 
 #define FACT_FETCH_DELAY 7000  // Задержка 7 секунд после смены трека перед первым запросом факта
 #define FACT_MANUAL_DELAY 5000 // Задержка 5 секунд перед ручным запросом факта
+
+static bool isIterativeSource(FactSource source);
+static void stripRadioStreamPromoTail(String& s);
+static size_t countFactsInPackedString(const String& s);
+static bool factsStringsLookLikeCatalog(const std::vector<String>& facts);
+
+bool TrackFacts::isMultiFactGatherOngoing() {
+  if (player.status() != PLAYING) return false;
+  if (!_enabled || factLoaded || factsPerTrack <= 1) return false;
+  if (!isIterativeSource(_effectiveSource)) return false;
+  if (factRequestCounter >= factsPerTrack) return false;
+  // При отключённом авто-запросе «надо бы ещё фрагментов» не означает идёт сеть:
+  // иначе /api/current-fact даёт pending и WebUI вешает ⏳ на каждый новый трек.
+  if (!TRACKFACTS_AUTO_FETCH_ENABLE) {
+    return isRequestInProgress || manualRequestPending;
+  }
+  if (xSemaphoreTake(_factsMutex, pdMS_TO_TICKS(40)) == pdTRUE) {
+    const bool needMore = currentFacts.size() < (size_t)factsPerTrack;
+    xSemaphoreGive(_factsMutex);
+    return needMore;
+  }
+  return isRequestInProgress || manualRequestPending;
+}
 
 // ============================================================================
 // Конструктор
@@ -48,18 +85,22 @@ TrackFacts::TrackFacts()
     manualRequestPending(false), manualRequestAtMs(0),
     manualRequestDeadlineMs(0), manualStableSinceMs(0),
     _pendingFetchIsManual(false),
+    _manualMoreFragmentsUi(false),
     _factsSslEpoch(0),
     _failoverActive(false), _failoverNotified(false),
     _suppressFailoverToastUntilMs(0),
-    lastStatusMs(0) {
+    lastStatusMs(0),
+    _notifiedItunesAiFallback(false),
+    _notifiedFlacItunesAuto(false),
+    _notifiedFactExhaustedToast(false),
+    _displayFactsAreAi(false) {
   _factsMutex = xSemaphoreCreateMutex(); // [v0.3.23] Инициализация мьютекса
 
-  // [v0.4.1] Создаём экземпляры всех провайдеров (позиции iTunes и MusicBrainz поменяны)
   _providers[0] = new GeminiProvider();     // FactSource::GEMINI = 0
   _providers[1] = new DeepSeekProvider();   // FactSource::DEEPSEEK = 1
   _providers[2] = new iTunesProvider();     // FactSource::ITUNES = 2 (по умолчанию)
   _providers[3] = new LastFmProvider();     // FactSource::LASTFM = 3
-  _providers[4] = new MusicBrainzProvider();// FactSource::MUSICBRAINZ = 4
+  _providers[4] = new GroqProvider();       // FactSource::GROQ = 4
   _providers[5] = nullptr;                 // FactSource::CUSTOM = 5 (не реализован)
 
   registerPlugin(); // Регистрация плагина в системе
@@ -87,6 +128,7 @@ void TrackFacts::on_track_change() {
   manualRequestAtMs = 0;
   manualRequestDeadlineMs = 0;
   manualStableSinceMs = 0;
+  _manualMoreFragmentsUi = false;
   currentFacts.clear();
   // [Gemini3Pro] Резервируем память под 5 элементов во избежание множественных реаллокаций в DRAM
   if (currentFacts.capacity() < 5) {
@@ -101,6 +143,9 @@ void TrackFacts::on_track_change() {
   ::currentFact = "";
   // Сброс уведомления failover для нового трека (покажем ещё раз если нужно)
   _failoverNotified = false;
+  _notifiedItunesAiFallback = false;
+  _notifiedFlacItunesAuto = false;
+  _notifiedFactExhaustedToast = false;
   lastStatusMs = 0; // Сбрасываем время статуса для нового трека
 }
 
@@ -127,11 +172,15 @@ void TrackFacts::on_station_change() {
   manualRequestAtMs = 0;
   manualRequestDeadlineMs = 0;
   manualStableSinceMs = 0;
+  _manualMoreFragmentsUi = false;
   factRequestCounter = 0;
   isRequestInProgress = false;
   resumeDeferredCoverDownload();
   _failoverActive = false;
   _failoverNotified = false;
+  _notifiedItunesAiFallback = false;
+  _notifiedFlacItunesAuto = false;
+  _notifiedFactExhaustedToast = false;
   lastStatusMs = 0;
 
   // 3) Очищаем текущие факты и глобальную строку для WebUI под мьютексом, чтобы
@@ -143,6 +192,7 @@ void TrackFacts::on_station_change() {
     ::currentFact = "";
     xSemaphoreGive(_factsMutex);
   }
+  _displayFactsAreAi = false;
 
   // 4) Резервируем ёмкость вектора, как и в on_track_change, чтобы избежать лишних реаллокаций.
   if (currentFacts.capacity() < 5) {
@@ -161,17 +211,38 @@ extern bool isSafeForSSL();  // [FIX] Проверка heap/WiFi/cooldown
 // ============================================================================
 void TrackFacts::on_ticker() {
   if (!_enabled) return;
-  
-  // [v0.4.1] Сбрасываем отображение при остановке композиции
-  if (player.status() != PLAYING) {
+
+  const bool playing = (player.status() == PLAYING);
+  static bool prevPlaying = false;
+
+  // [v0.4.1] При остановке потока — прерываем фоновый запрос фактов (как при смене трека) и сбрасываем UI.
+  if (!playing) {
+    if (prevPlaying) {
+      _factsSslEpoch++;
+      manualRequestPending = false;
+      manualRequestDeadlineMs = 0;
+      manualRequestAtMs = 0;
+      _manualMoreFragmentsUi = false;
+    }
+    prevPlaying = false;
+
     if (::currentFact.length() > 0) {
-      ::currentFact = "";
-      currentFacts.clear();
+      if (xSemaphoreTake(_factsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        currentFacts.clear();
+        ::currentFact = "";
+        xSemaphoreGive(_factsMutex);
+      } else {
+        currentFacts.clear();
+        ::currentFact = "";
+      }
+      _displayFactsAreAi = false;
       factLoaded = false;
       factRequestCounter = 0;
     }
     return;
   }
+
+  prevPlaying = true;
 
   uint32_t now = millis();
   if (now - lastTickerCheck < 1000) return; // Проверка раз в секунду
@@ -190,6 +261,7 @@ void TrackFacts::on_ticker() {
       sendStatus(rejectReason.c_str(), true);
       manualRequestPending = false;
       manualRequestDeadlineMs = 0;
+      _manualMoreFragmentsUi = false;
     } else {
       // Условия уже ОК, но тикер долго не доходил до fetch (обложка) — продлеваем окно.
       manualRequestDeadlineMs = now + 30000u;
@@ -207,10 +279,12 @@ void TrackFacts::on_ticker() {
     return;
   }
 
-  // [v0.3.3] Пауза 8 секунд после завершения загрузки обложки, 
-  // чтобы дать системе освободить память и избежать ошибки -32512.
-  // Также это гарантирует, что мы не попадем в "шторм" SSL рукопожатий.
-  if (now - factLoadTime < 8000 && !factLoaded && factRequestCounter == 0) return;
+  // [v0.3.3] Пауза 8 секунд после завершения загрузки обложки для ПЕРВОГО авто-запроса.
+  // Ручной запрос (окно фактов) не блокируем — иначе пользователь жмёт обложку много раз вхолостую.
+  if (now - factLoadTime < 8000 && !factLoaded && factRequestCounter == 0 &&
+      !manualRequestPending) {
+    return;
+  }
 
   if (metaTitle.length() == 0) return;
 
@@ -229,6 +303,8 @@ void TrackFacts::on_ticker() {
       int separatorPos = metaTitle.indexOf(" - ");
       title = metaTitle.substring(separatorPos + 3);
     }
+    stripRadioStreamPromoTail(artist);
+    stripRadioStreamPromoTail(title);
     lastArtist = artist;
     lastParsedTitle = title;
     trackChangeMs = now;
@@ -252,6 +328,7 @@ void TrackFacts::on_ticker() {
       ::currentFact = "";  // Очистка глобальной переменной (убирает текст с WebUI)
       xSemaphoreGive(_factsMutex);
     }
+    _displayFactsAreAi = false;
     factLoaded = false;
     _factsSslEpoch++;
     // НЕ isRequestInProgress = false — см. on_station_change (параллельный TLS с CoverDL).
@@ -286,23 +363,30 @@ void TrackFacts::on_ticker() {
         Serial.printf("[TrackFacts] Cache hit: %d facts for '%s'\n",
                       currentFacts.size(), trackKey.c_str());
         Serial.printf("[TrackFacts] UI Updated (Cache): %s\n", allFacts.c_str());
+        _displayFactsAreAi =
+            isIterativeSource(_effectiveSource) && !factsStringsLookLikeCatalog(tmpFacts);
       }
     }
   }
 
   // --- Логика последовательного накопления фактов ---
-  // [v0.4.1] ОГРАНИЧЕНИЕ: Для iTunes/MusicBrainz/LastFM делаем только ОДИН запрос.
+  // [v0.4.1] ОГРАНИЧЕНИЕ: Для iTunes/LastFM (не итеративных) — один запрос.
   // Повторные запросы для метаданных не имеют смысла, они возвращают то же самое.
   if (!factLoaded && currentFacts.size() < (size_t)factsPerTrack && !isRequestInProgress && factRequestCounter < factsPerTrack) {
     uint32_t now = millis();
-    bool canAuto = (!autoRequestDone && (now - trackChangeMs >= FACT_FETCH_DELAY));
+    const bool allowAutoTrackFetch = TRACKFACTS_AUTO_FETCH_ENABLE;
+    bool canAuto =
+        allowAutoTrackFetch && (!autoRequestDone && (now - trackChangeMs >= FACT_FETCH_DELAY));
     bool canManual = (manualRequestPending && now >= manualRequestAtMs);
 
     if ((canAuto || canManual) && lastParsedTitle.indexOf("[") < 0) {
-      // Синхронизируем effective source ДО FLAC-гейта:
-      // иначе on_ticker может принять решение по старому _effectiveSource,
-      // а в fetchFact() после checkFailover стартует уже другой провайдер (например DeepSeek).
       checkFailover();
+      const bool iterativeContinueBatch =
+          factsPerTrack > 1 &&
+          isIterativeSource(_effectiveSource) &&
+          !factLoaded &&
+          currentFacts.size() > 0 &&
+          currentFacts.size() < (size_t)factsPerTrack;
       // [FIX v0.8.81] На FLAC-потоках DeepSeek/Gemini иногда вызывают заметные фризы
       // и даже сетевые assert (lwIP/pbuf_free) из-за тяжёлых TLS/JSON операций параллельно
       // с декодированием. Для стабильности: на FLAC блокируем АВТОМАТИЧЕСКИЕ AI-запросы,
@@ -317,29 +401,30 @@ void TrackFacts::on_ticker() {
       //   подставляет _effectiveSource = ITUNES. В этом случае считаем источник НЕ AI
       //   и НЕ блокируем авто‑запросы iTunes (иначе iTunes "умирал" и работал только вручную).
       const bool isHeavyAiSource =
-        (_effectiveSource == FactSource::GEMINI || _effectiveSource == FactSource::DEEPSEEK);
+        (_effectiveSource == FactSource::GEMINI || _effectiveSource == FactSource::DEEPSEEK ||
+         _effectiveSource == FactSource::GROQ);
       const bool autoGeminiBlocked =
         (canAuto && _effectiveSource == FactSource::GEMINI && !TRACKFACTS_AUTO_GEMINI_ENABLE);
       const bool autoDeepSeekBlocked =
         (canAuto && _effectiveSource == FactSource::DEEPSEEK && !TRACKFACTS_AUTO_DEEPSEEK_ENABLE);
-      if (autoGeminiBlocked || autoDeepSeekBlocked) {
-        autoRequestDone = true;  // Не повторяем автопопытки до следующей смены трека.
-        // [REQ] Если авто-facts для провайдера принудительно отключены в myoptions.h,
-        // не спамим пользователя сообщениями (и в Serial, и в WebUI).
-        // Для предотвращения “штормов” обновляем lastStatusMs, но toast не отправляем.
-        if (now - lastStatusMs > 5000) {
-          lastStatusMs = now;
+      const bool autoGroqBlocked =
+        (canAuto && _effectiveSource == FactSource::GROQ && !TRACKFACTS_AUTO_GROQ_ENABLE);
+      if (autoGeminiBlocked || autoDeepSeekBlocked || autoGroqBlocked) {
+        if (!iterativeContinueBatch) {
+          autoRequestDone = true;  // Не повторяем автопопытки до следующей смены трека.
+          if (now - lastStatusMs > 5000) {
+            lastStatusMs = now;
+          }
+          canAuto = false;
+          if (!canManual) return;
         }
-        canAuto = false;
-        if (!canManual) return;
       }
-      if (isFlacStream && isHeavyAiSource && canAuto) {
+      if (isFlacStream && isHeavyAiSource && canAuto && !iterativeContinueBatch) {
         autoRequestDone = true;  // не пытаться автозапросом снова и снова
         if (now - lastStatusMs > 5000) {
-          sendStatus("Авто-AI-факты отключены для FLAC (стабильность аудио). Ручной запрос доступен.");
+          sendStatus("Авто-подсказки AI отключены для стабильности звука. Запрос по обложке доступен.");
           lastStatusMs = now;
         }
-        // Авто-запрос заблокирован, но ручной (canManual) может пойти дальше по обычной ветке.
         canAuto = false;
         if (!canManual) return;
       }
@@ -353,13 +438,13 @@ void TrackFacts::on_ticker() {
           // Для АВТО-режима сохраняем старое строгое поведение: низкий буфер = отложить.
           // Для РУЧНОГО запроса разрешаем special retry: 5% буфера + стабильный поток 10 сек.
           bool allowManualLowBuffer = false;
+          String lowBufManualReject;
           if (canManual) {
-            String rejectReason;
-            allowManualLowBuffer = canRunManualLowBufferRetry(now, &rejectReason);
+            allowManualLowBuffer = canRunManualLowBufferRetry(now, &lowBufManualReject);
             if (!allowManualLowBuffer && now - lastStatusMs > 3000) {
               // Если ручной запрос пока нельзя выполнить, сообщаем пользователю причину.
               // Сообщение отправляем не чаще, чем раз в 3 секунды, чтобы не спамить toast.
-              sendStatus(rejectReason.c_str(), true);
+              sendStatus(lowBufManualReject.c_str(), true);
               lastStatusMs = now;
             }
           }
@@ -372,6 +457,16 @@ void TrackFacts::on_ticker() {
             }
             if (now - lastStatusMs > 5000) {
               lastStatusMs = now;
+            }
+            // Ждём стабилизацию потока — запрос в очереди, WebUI может показывать ⏳.
+            // Остальные отказы: снимаем очередь, иначе /api/current-fact остаётся pending и ⏳ не исчезает.
+            if (canManual && lowBufManualReject.length() > 0) {
+              if (lowBufManualReject.indexOf("ждём стабилизацию") < 0 &&
+                  lowBufManualReject.indexOf("поток ещё не стабилен") < 0) {
+                manualRequestPending = false;
+                manualRequestDeadlineMs = 0;
+                _manualMoreFragmentsUi = false;
+              }
             }
             return;
           }
@@ -418,7 +513,7 @@ void TrackFacts::on_ticker() {
             sendStatus("Загрузка обложки. Факты в очереди...");
           } else if (ESP.getFreeHeap() < 35000) {
             Serial.printf("[TrackFacts] Запрос отложен: Критически мало памяти (%u байт)\n", ESP.getFreeHeap());
-            sendStatus("Мало памяти для SSL. Ждем освобождения...");
+            sendStatus("Мало свободной памяти. Подождите несколько секунд и повторите.");
           } else if (WiFi.status() != WL_CONNECTED) {
             Serial.println("[TrackFacts] Запрос отложен: Нет соединения WiFi");
             sendStatus("WiFi не подключен. Запрос отложен.");
@@ -426,21 +521,37 @@ void TrackFacts::on_ticker() {
           lastStatusMs = now;
         }
       }
+      // Для AI с factsPerTrack>1 нужны отдельные запросы на каждый факт; autoRequestDone=true
+      // после первого же старте блокировал бы все следующие (canAuto стал бы ложным навсегда).
       if (canAuto) {
-        autoRequestDone = true;
+        if (!isIterativeSource(_effectiveSource) || factsPerTrack <= 1) {
+          autoRequestDone = true;
+        }
       }
-      if (canManual) {
+      // Снимаем ручную очередь только если fetch реально поставлен; иначе ждём следующего тика (SSL/обложка).
+      if (canManual && isSafeForSSLForFacts()) {
         manualRequestPending = false;
         manualRequestDeadlineMs = 0;
       }
     }
   }
 
-  // [v0.4.1] Если загрузка завершена (или лимит 8 для AI) и фактов нет — стоп
-  if ((factLoaded || factRequestCounter >= factsPerTrack) && currentFacts.empty() && ::currentFact.length() == 0) {
+  // Фактов нет, дальше запросы не планируются: различаем «источник ответил, данных нет» и «запросы исчерпаны без успеха».
+  // При factsPerTrack==1 и сбое AI factLoaded остаётся false, но factRequestCounter уже 1 — это не «лимит API», а сеть/SSL/ключ.
+  // Не показываем сообщение, пока FactsTask в полёте: счётчик уже увеличен, а currentFact ещё пуст.
+  if (!isRequestInProgress && (factLoaded || factRequestCounter >= factsPerTrack) && currentFacts.empty() && ::currentFact.length() == 0) {
+    if (factLoaded) {
       ::currentFact = (currentLanguage == FactLanguage::RUSSIAN) ?
-          "Факты не найдены (ошибка API или превышен лимит)." :
-          "No facts found (API error or limit reached).";
+          "Факты не найдены (источник не вернул данные по этому треку)." :
+          "No facts found for this track from the selected source.";
+    } else if (!_notifiedFactExhaustedToast) {
+      sendStatus(
+          (currentLanguage == FactLanguage::RUSSIAN) ?
+              "Факт не получен: проверьте Wi‑Fi, ключ API провайдера и повторите чуть позже." :
+              "Fact not fetched: check Wi‑Fi, provider API key, and try again shortly.",
+          true);
+      _notifiedFactExhaustedToast = true;
+    }
   }
 }
 
@@ -449,7 +560,7 @@ void TrackFacts::processMetadata() {
 }
 
 // ============================================================================
-// Failover: Проверка API ключа и авто-переключение на MusicBrainz
+// Failover: проверка API ключа и переключение на iTunes
 // ============================================================================
 
 // [v0.4.0] Получить провайдер по индексу FactSource (с проверкой границ)
@@ -513,19 +624,30 @@ void TrackFacts::sendStatus(const char* msg, bool isError) {
 
 // ============================================================================
 // Определяет, нужно ли кэшировать факт от данного провайдера
-// Кэшируем только "дорогие" факты от AI (Gemini, DeepSeek)
-// MusicBrainz/LastFM — лёгкие и бесплатные, не кэшируем
+// Кэшируем AI (Gemini, DeepSeek, Groq) и iTunes
 // ============================================================================
 bool TrackFacts::shouldCacheFact(FactSource source) const {
-  // Кэшируем "дорогие" AI-запросы и iTunes (по просьбе пользователя)
-  return (source == FactSource::GEMINI || 
-          source == FactSource::DEEPSEEK || 
+  return (source == FactSource::GEMINI ||
+          source == FactSource::DEEPSEEK ||
+          source == FactSource::GROQ ||
           source == FactSource::ITUNES);
 }
 
 // Порождает ли источник по одному факту за запрос (требуется несколько запросов для накопления)
-bool isIterativeSource(FactSource source) {
-  return (source == FactSource::GEMINI || source == FactSource::DEEPSEEK);
+static bool isIterativeSource(FactSource source) {
+  return (source == FactSource::GEMINI || source == FactSource::DEEPSEEK ||
+          source == FactSource::GROQ);
+}
+
+static bool factsStringsLookLikeCatalog(const std::vector<String>& facts) {
+  for (const auto& f : facts) {
+    String t = f;
+    t.trim();
+    if (t.length() == 0) continue;
+    if (t.startsWith("iTunes:")) return true;
+    if (t.startsWith("Last.fm")) return true;
+  }
+  return false;
 }
 
 // ============================================================================
@@ -549,7 +671,8 @@ void TrackFacts::fetchFact(const String& artist, const String& title) {
         (config.getMode() == PM_WEB) &&
         (config.getBitrateFormat() == BF_FLAC || g_audioFormatFlacActive);
     if (flacHeuristic &&
-        (_effectiveSource == FactSource::GEMINI || _effectiveSource == FactSource::DEEPSEEK)) {
+        (_effectiveSource == FactSource::GEMINI || _effectiveSource == FactSource::DEEPSEEK ||
+         _effectiveSource == FactSource::GROQ)) {
       // #region agent log
       Serial.printf("[AGENT][H6] FLAC policy: forcing iTunes for AUTO (was src=%d flacHint=%d bf=%d)\n",
                     (int)_effectiveSource,
@@ -557,6 +680,10 @@ void TrackFacts::fetchFact(const String& artist, const String& title) {
                     (int)config.getBitrateFormat());
       // #endregion
       _effectiveSource = FactSource::ITUNES;
+      if (!_notifiedFlacItunesAuto) {
+        sendStatus("В авто-режиме выбран лёгкий источник вместо AI — так стабильнее воспроизведение.");
+        _notifiedFlacItunesAuto = true;
+      }
     }
   }
 
@@ -565,6 +692,28 @@ void TrackFacts::fetchFact(const String& artist, const String& title) {
   params->title = title;
   params->instance = this;
   params->sslEpoch = _factsSslEpoch;
+  params->factIndex1 = factRequestCounter;
+  params->factTotal = factsPerTrack;
+  params->priorFactsBrief = "";
+  params->isManual = _pendingFetchIsManual;
+  if (factsPerTrack >= 2 && isIterativeSource(_effectiveSource)) {
+    if (xSemaphoreTake(_factsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      const size_t cap = 450;
+      for (const auto& f : currentFacts) {
+        if (params->priorFactsBrief.length() >= cap) break;
+        String part = f;
+        part.trim();
+        if (part.length() > 120) part = part.substring(0, 120) + "...";
+        if (params->priorFactsBrief.length() > 0) params->priorFactsBrief += " | ";
+        params->priorFactsBrief += part;
+        if (params->priorFactsBrief.length() > cap) {
+          params->priorFactsBrief = params->priorFactsBrief.substring(0, cap);
+          break;
+        }
+      }
+      xSemaphoreGive(_factsMutex);
+    }
+  }
 
   // Сетевой запрос фактов выполняем на Core 1.
   // Попытка переноса на Core 0 в v0.8.77 привела к редким assert в lwIP (pbuf_free),
@@ -663,16 +812,34 @@ void TrackFacts::fetchTask(void* parameter) {
                     (unsigned)ESP.getMaxAllocHeap());
       // #endregion
       Serial.printf("[TrackFacts] Fetching from %s...\n", provider->name());
-      FactResult result = provider->fetchFact(p->artist, p->title);
+      FactFetchContext fctx;
+      const FactFetchContext* ctxPtr = nullptr;
+      if (instance->factsPerTrack >= 2 && isIterativeSource(sourceToUse)) {
+        fctx.factIndex1 = p->factIndex1;
+        fctx.factTotal = p->factTotal;
+        fctx.priorFactsBrief = p->priorFactsBrief;
+        ctxPtr = &fctx;
+      }
+      FactResult result = provider->fetchFact(p->artist, p->title, ctxPtr);
       bool usedItunesFallback = false;
 
-      // Если DeepSeek/Gemini не достучались до сети или отрезали по heap (pre-POST),
-      // один раз пробуем iTunes — другой хост, как в шпаргалке (лёгкий failover, без циклов).
+      // Запасной iTunes только при сети/SSL или временной недоступности AI (5xx, 429).
+      // Ответы 401/403/400 и т.п. — это ключ/запрос: подмена на iTunes вводила в заблуждение (особенно для Groq).
+      const String& aiErr = result.errorMsg;
+      const bool aiTransientNet =
+          aiErr.indexOf("Connection failed") >= 0 || aiErr.indexOf("SSL not safe") >= 0;
+      const bool aiTransientHttp =
+          aiErr.indexOf("HTTP error: 5") >= 0 || aiErr.indexOf("HTTP error: 429") >= 0;
+      // Серия из N AI-фактов: не подменяем iTunes — иначе в UI смешиваются магазин и LLM и
+      // usedItunesFallback выставляет factLoaded до набора всех слотов (третий запрос не идёт).
+      const bool multiFactAiBatch =
+          instance->factsPerTrack > 1 && isIterativeSource(sourceToUse);
       if (!result.success &&
-          (sourceToUse == FactSource::DEEPSEEK || sourceToUse == FactSource::GEMINI) &&
-          (result.errorMsg.indexOf("Connection failed") >= 0 ||
-           result.errorMsg.indexOf("SSL not safe") >= 0 ||
-           result.errorMsg.indexOf("HTTP error") >= 0)) {
+          !p->isManual &&
+          !multiFactAiBatch &&
+          (sourceToUse == FactSource::DEEPSEEK || sourceToUse == FactSource::GEMINI ||
+           sourceToUse == FactSource::GROQ) &&
+          (aiTransientNet || aiTransientHttp)) {
         FactProvider* fb = instance->getProvider(FactSource::ITUNES);
         if (fb) {
           Serial.println("[TrackFacts] AI unreachable, one-shot iTunes fallback");
@@ -695,9 +862,14 @@ void TrackFacts::fetchTask(void* parameter) {
             result.success = false;
             result.errorMsg = "stale epoch";
           } else {
-            result = fb->fetchFact(p->artist, p->title);
+            result = fb->fetchFact(p->artist, p->title, nullptr);
             if (result.success && result.fact.length() > 0) {
               usedItunesFallback = true;
+              if (!instance->_notifiedItunesAiFallback) {
+                instance->sendStatus(
+                    "AI временно не ответил; показан факт из запасного каталога.");
+                instance->_notifiedItunesAiFallback = true;
+              }
             }
           }
         }
@@ -720,16 +892,21 @@ void TrackFacts::fetchTask(void* parameter) {
           String trackKey = instance->generateTrackKey(p->artist, p->title);
           instance->saveFactToCache(trackKey, result.fact);
         }
+        instance->_displayFactsAreAi =
+            !usedItunesFallback && isIterativeSource(sourceToUse);
         // Обновляем UI
         instance->updateDisplayFact(result.fact);
         
-        // [v0.4.1] Один запуск FREE-провайдеров (iTunes, MusicBrainz, LastFM)
+        // Один запуск не-итеративных провайдеров (iTunes, LastFM) и запасной iTunes после AI
         // возвращает всю информацию за раз. AI-провайдеры (итеративные) требуют 
         // несколько запросов для сбора нужного количества фактов.
         if (!isIterativeSource(sourceToUse) || usedItunesFallback) {
           instance->factLoaded = true;
         } else if (instance->currentFacts.size() >= (size_t)instance->factsPerTrack) {
           instance->factLoaded = true;  // AI — достаточно фактов собрано
+        }
+        if (instance->factLoaded && isIterativeSource(sourceToUse)) {
+          instance->autoRequestDone = true;
         }
       } else if (epochStale) {
         Serial.println("[TrackFacts] Discarding fact result: station/track changed during fetch (SSL epoch)");
@@ -759,6 +936,7 @@ void TrackFacts::fetchTask(void* parameter) {
     }
 
     // Сбрасываем флаг после завершения всей работы
+    instance->_manualMoreFragmentsUi = false;
     instance->isRequestInProgress = false;
     if (needLwIpCoolDown) {
       vTaskDelay(pdMS_TO_TICKS(2000));
@@ -1051,34 +1229,45 @@ void TrackFacts::registerFactsCacheFile(const String& path) {
 // Добавляет факт к списку текущих фактов и формирует строку с разделителями ###
 // ============================================================================
 void TrackFacts::updateDisplayFact(const String& fact) {
-  // Serial.printf("[TrackFacts] DEBUG: updateDisplayFact called with '%s'\n", fact.c_str());
   if (xSemaphoreTake(_factsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-    // Проверяем дубликаты
+    String toAdd = fact;
     bool exists = false;
     for (const auto& f : currentFacts) {
-      if (f == fact) {
+      if (f == toAdd) {
         exists = true;
         break;
       }
     }
+    if (exists && factsPerTrack > 1) {
+      for (uint8_t n = 2; n < 24; n++) {
+        toAdd = fact + " [" + String(n) + "]";
+        bool clash = false;
+        for (const auto& f : currentFacts) {
+          if (f == toAdd) {
+            clash = true;
+            break;
+          }
+        }
+        if (!clash) {
+          exists = false;
+          break;
+        }
+      }
+    }
 
     if (!exists) {
-        currentFacts.push_back(fact);
+        currentFacts.push_back(toAdd);
 
-        // Формируем новую строку ::currentFact
         String allFacts = "";
         for (size_t i = 0; i < currentFacts.size(); i++) {
           if (i > 0) allFacts += "###";
           allFacts += currentFacts[i];
         }
-        
+
         ::currentFact = allFacts;
-        
-        Serial.printf("[TrackFacts] UI Updated: %d facts, total length: %d bytes\n", 
+
+        Serial.printf("[TrackFacts] UI Updated: %d facts, total length: %d bytes\n",
                       (int)currentFacts.size(), (int)allFacts.length());
-        // Serial.printf("[TrackFacts] Current Facts: %s\n", allFacts.c_str());
-    } else {
-        // Serial.println("[TrackFacts] Fact already exists in current list");
     }
     xSemaphoreGive(_factsMutex);
   } else {
@@ -1107,21 +1296,23 @@ void TrackFacts::setFactSource(FactSource source) {
 }
 
 void TrackFacts::setProvider(uint8_t provider) {
-  // [v0.4.1] Установка провайдера по ID из веб-интерфейса (iTunes и MusicBrainz поменяны)
   FactSource oldSource = currentSource;
   if (provider == 0) {
     currentSource = FactSource::GEMINI;
   } else if (provider == 1) {
     currentSource = FactSource::DEEPSEEK;
   } else if (provider == 2) {
-    currentSource = FactSource::ITUNES;       // [v0.4.1] Был MusicBrainz, теперь iTunes
+    currentSource = FactSource::ITUNES;
   } else if (provider == 3) {
     currentSource = FactSource::LASTFM;
   } else if (provider == 4) {
-    currentSource = FactSource::MUSICBRAINZ;  // [v0.4.1] Был iTunes, теперь MusicBrainz
+    currentSource = FactSource::GROQ;
   }
 
   if (currentSource != oldSource) {
+    // Инвалидация старых FactsTask: если в полёте был запрос прежнего провайдера,
+    // его результат не должен попасть в UI после смены источника.
+    _factsSslEpoch++;
     // [v0.4.4] Сбрасываем состояние при смене провайдера, чтобы не висели факты
     // от старого источника (например, DeepSeek) после переключения на iTunes.
     factRequestCounter = 0;
@@ -1130,8 +1321,12 @@ void TrackFacts::setProvider(uint8_t provider) {
     resumeDeferredCoverDownload();
     _failoverActive = false;
     _failoverNotified = false;
+    _notifiedItunesAiFallback = false;
+    _notifiedFlacItunesAuto = false;
+    _notifiedFactExhaustedToast = false;
     autoRequestDone = false; // Разрешаем повторный авто-запрос для текущей песни
     lastStatusMs = 0;
+    _effectiveSource = currentSource;
 
     FactProvider* newProv = getProvider(currentSource);
     const bool needsKeyButEmpty =
@@ -1147,6 +1342,7 @@ void TrackFacts::setProvider(uint8_t provider) {
       ::currentFact = "";
       xSemaphoreGive(_factsMutex);
     }
+    _displayFactsAreAi = false;
 
     // Даем возможность новому провайдеру сработать быстрее (сбрасываем таймер ожидания),
     // чтобы автозапрос не ждал ещё 7 секунд после переключения провайдера.
@@ -1174,10 +1370,30 @@ void TrackFacts::setLanguage(FactLanguage lang) {
 }
 
 void TrackFacts::setFactCount(uint8_t count) {
-  // [v0.4.1] Количество фактов для сбора (1-3, уменьшено с 10)
-  if (count > 0 && count <= 3) {
+  if (count > 0 && count <= TRACKFACTS_MAX_PER_TRACK) {
     factsPerTrack = count;
   }
+}
+
+String TrackFacts::currentFactTrackLabelForApi() const {
+  if (!_enabled || lastParsedTitle.length() == 0) return String();
+  if (lastArtist.length() > 0) return lastArtist + " - " + lastParsedTitle;
+  return lastParsedTitle;
+}
+
+bool TrackFacts::manualMoreFragmentsUi() const {
+  if (!_enabled || !_manualMoreFragmentsUi) return false;
+  return manualRequestPending || isRequestInProgress;
+}
+
+bool TrackFacts::incompleteIterativeSeriesForApi() const {
+  if (!_enabled || factLoaded || factsPerTrack <= 1) return false;
+  if (!isIterativeSource(_effectiveSource)) return false;
+  if (isRequestInProgress || manualRequestPending) return false;
+  if (xSemaphoreTake(_factsMutex, pdMS_TO_TICKS(40)) != pdTRUE) return false;
+  const size_t n = currentFacts.size();
+  xSemaphoreGive(_factsMutex);
+  return n > 0 && n < (size_t)factsPerTrack;
 }
 
 void TrackFacts::setEnabled(bool enabled) {
@@ -1189,14 +1405,76 @@ void TrackFacts::setEnabled(bool enabled) {
     resumeDeferredCoverDownload();
     factLoaded = false;
     factRequestCounter = 0;
+    _manualMoreFragmentsUi = false;
     currentFacts.clear();
     ::currentFact = "";
   }
 }
 
-// Ручной запрос факта из WebUI (по клику на логотип/обложку)
+// Убирает хвосты вида "*** www.station..." / URL, которые станции дописывают в ICY-meta.
+static void stripRadioStreamPromoTail(String& s) {
+  s.trim();
+  if (s.length() == 0) return;
+
+  int pos = s.indexOf(" ***");
+  if (pos >= 0) {
+    s = s.substring(0, pos);
+    s.trim();
+    return;
+  }
+  pos = s.indexOf("\t***");
+  if (pos >= 0) {
+    s = s.substring(0, pos);
+    s.trim();
+    return;
+  }
+  int tri = s.indexOf("***");
+  if (tri > 0) {
+    s = s.substring(0, tri);
+    s.trim();
+    return;
+  }
+  pos = s.indexOf("http://");
+  if (pos > 0) {
+    s = s.substring(0, pos);
+    s.trim();
+    return;
+  }
+  pos = s.indexOf("https://");
+  if (pos > 0) {
+    s = s.substring(0, pos);
+    s.trim();
+    return;
+  }
+  pos = s.indexOf(" | www.");
+  if (pos > 0) {
+    s = s.substring(0, pos);
+    s.trim();
+    return;
+  }
+  pos = s.indexOf(" www.");
+  if (pos > 0) {
+    s = s.substring(0, pos);
+    s.trim();
+  }
+}
+
+static size_t countFactsInPackedString(const String& s) {
+  if (s.length() == 0) return 0;
+  size_t n = 1;
+  int p = 0;
+  for (;;) {
+    int idx = s.indexOf("###", p);
+    if (idx < 0) break;
+    n++;
+    p = idx + 3;
+  }
+  return n;
+}
+
+// Ручной запрос факта из WebUI (по клику на логотип/обложку в плеере — не загрузка JPG обложки).
 // Возвращает true, если был запланирован НОВЫЙ сетевой запрос.
-// Возвращает false, если факты уже есть (RAM/файловый кэш) или запрос уже в процессе.
+// Возвращает false, если полный комплект уже в RAM/файле или запрос уже в процессе.
 bool TrackFacts::requestManualFact(String* rejectReason) {
   // Подробная проверка №1: если модуль выключен, ничего не делаем.
   if (!_enabled) {
@@ -1212,23 +1490,42 @@ bool TrackFacts::requestManualFact(String* rejectReason) {
     return false;
   }
 
-  // Подробная проверка №2: если факты уже есть в оперативном состоянии текущего трека,
-  // не ставим повторный сетевой запрос и не триггерим лишний "ожидание..." статус.
+  if (player.status() != PLAYING) {
+    if (rejectReason) {
+      *rejectReason = (currentLanguage == FactLanguage::ENGLISH)
+          ? "Facts can be requested only while playback is running."
+          : "Запрос факта доступен только во время воспроизведения.";
+    }
+    return false;
+  }
+
+  size_t ramFactCount = 0;
   bool hasFactsInRam = false;
   if (xSemaphoreTake(_factsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    ramFactCount = currentFacts.size();
     hasFactsInRam = !currentFacts.empty() || (::currentFact.length() > 0);
     xSemaphoreGive(_factsMutex);
   } else {
-    // Если мьютекс временно недоступен, используем мягкий fallback по глобальной строке.
     hasFactsInRam = (::currentFact.length() > 0);
+    if (hasFactsInRam) {
+      ramFactCount = countFactsInPackedString(::currentFact);
+    }
   }
-  if (hasFactsInRam) {
+
+  checkFailover();
+  const bool iterative = isIterativeSource(_effectiveSource);
+  const bool wantMoreIterativeFacts =
+      iterative && factsPerTrack > 1 && ramFactCount > 0 &&
+      ramFactCount < (size_t)factsPerTrack;
+
+  // Уже есть полный набор (или один факт у неитеративного источника) — только крутим существующее в UI.
+  if (hasFactsInRam && !wantMoreIterativeFacts) {
     if (rejectReason) *rejectReason = "Факт уже доступен: используем данные из памяти/кэша.";
     return false;
   }
 
-  // Подробная проверка №3: перед постановкой ручного запроса пытаемся поднять факты из файлового кэша.
-  // Это устраняет кейс "факт есть/был, но UI не успел синхронизироваться" без запуска API-запроса.
+  // Файловый кэш: полный набор или метаданные (iTunes/Last.fm) — без сети.
+  // Для AI с «недобором»: если RAM пуста — поднимаем часть с диска и ждём следующего нажатия для API.
   String artist = lastArtist;
   String title = lastParsedTitle;
   artist.trim();
@@ -1237,29 +1534,63 @@ bool TrackFacts::requestManualFact(String* rejectReason) {
     String trackKey = generateTrackKey(artist, title);
     std::vector<String> cachedFacts;
     if (getFactsFromCache(trackKey, cachedFacts)) {
-      if (xSemaphoreTake(_factsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        currentFacts = cachedFacts;
-        String allFacts = "";
-        for (size_t i = 0; i < currentFacts.size(); i++) {
-          if (i > 0) allFacts += "###";
-          allFacts += currentFacts[i];
+      const size_t n = cachedFacts.size();
+      const bool cacheStopsHere =
+          n >= (size_t)factsPerTrack || (!isIterativeSource(_effectiveSource) && n > 0);
+
+      if (cacheStopsHere) {
+        if (xSemaphoreTake(_factsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+          currentFacts = cachedFacts;
+          String allFacts = "";
+          for (size_t i = 0; i < currentFacts.size(); i++) {
+            if (i > 0) allFacts += "###";
+            allFacts += currentFacts[i];
+          }
+          ::currentFact = allFacts;
+          autoRequestDone = true;
+          xSemaphoreGive(_factsMutex);
+        } else {
+          String allFacts = "";
+          for (size_t i = 0; i < cachedFacts.size(); i++) {
+            if (i > 0) allFacts += "###";
+            allFacts += cachedFacts[i];
+          }
+          ::currentFact = allFacts;
         }
-        ::currentFact = allFacts;
-        // Помечаем автозапрос как выполненный, т.к. данные уже показаны из кэша.
-        autoRequestDone = true;
-        xSemaphoreGive(_factsMutex);
-      } else {
-        // Даже если мьютекс занят, запишем в глобальную строку "снаружи",
-        // чтобы /api/current-fact не возвращал пустой ответ.
-        String allFacts = "";
-        for (size_t i = 0; i < cachedFacts.size(); i++) {
-          if (i > 0) allFacts += "###";
-          allFacts += cachedFacts[i];
-        }
-        ::currentFact = allFacts;
+        _displayFactsAreAi =
+            isIterativeSource(_effectiveSource) && !factsStringsLookLikeCatalog(cachedFacts);
+        if (rejectReason) *rejectReason = "Факт получен из файлового кэша, сетевой запрос не требуется.";
+        return false;
       }
-      if (rejectReason) *rejectReason = "Факт получен из файлового кэша, сетевой запрос не требуется.";
-      return false;
+
+      // На диске больше строк, чем в RAM — подтянуть без сети (не ждать стабилизацию потока).
+      if (isIterativeSource(_effectiveSource) && n > 0 && n < (size_t)factsPerTrack &&
+          ramFactCount < n) {
+        if (xSemaphoreTake(_factsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+          currentFacts = cachedFacts;
+          String allFacts = "";
+          for (size_t i = 0; i < currentFacts.size(); i++) {
+            if (i > 0) allFacts += "###";
+            allFacts += currentFacts[i];
+          }
+          ::currentFact = allFacts;
+          autoRequestDone = false;
+          xSemaphoreGive(_factsMutex);
+        } else {
+          String allFacts = "";
+          for (size_t i = 0; i < cachedFacts.size(); i++) {
+            if (i > 0) allFacts += "###";
+            allFacts += cachedFacts[i];
+          }
+          ::currentFact = allFacts;
+        }
+        _displayFactsAreAi =
+            isIterativeSource(_effectiveSource) && !factsStringsLookLikeCatalog(cachedFacts);
+        if (rejectReason) {
+          *rejectReason = "Часть фактов из файлового кэша. Следующий фрагмент — ещё одно нажатие.";
+        }
+        return false;
+      }
     }
   }
 
@@ -1281,6 +1612,14 @@ bool TrackFacts::requestManualFact(String* rejectReason) {
   }
 
   // Здесь реально планируем новый сетевой запрос.
+  {
+    size_t nExisting = 0;
+    if (xSemaphoreTake(_factsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      nExisting = currentFacts.size();
+      xSemaphoreGive(_factsMutex);
+    }
+    _manualMoreFragmentsUi = (nExisting > 0);
+  }
   manualRequestPending = true;
   manualRequestAtMs = now + FACT_MANUAL_DELAY;
   // Ограничиваем время ожидания условий запуска:

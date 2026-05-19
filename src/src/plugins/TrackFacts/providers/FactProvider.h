@@ -22,6 +22,13 @@ enum class ProviderLanguage {
   AUTO = 2
 };
 
+// Контекст для N-го факта в серии (Gemini/DeepSeek/Groq). nullptr = одиночный запрос как раньше.
+struct FactFetchContext {
+  uint8_t factIndex1 = 0;  // 1..factTotal
+  uint8_t factTotal = 0;   // 0 = не серия; >=2 = итеративный режим
+  String priorFactsBrief;  // кратко уже выданные факты (не дублировать)
+};
+
 // ============================================================================
 // Базовый класс-интерфейс для всех провайдеров фактов
 // ============================================================================
@@ -31,7 +38,9 @@ public:
 
   // Основной метод: получить факт о треке по имени артиста и названию
   // Возвращает FactResult с текстом факта или ошибкой
-  virtual FactResult fetchFact(const String& artist, const String& title) = 0;
+  // ctx == nullptr или factTotal < 2: поведение как у одиночного факта.
+  virtual FactResult fetchFact(const String& artist, const String& title,
+                               const FactFetchContext* ctx = nullptr) = 0;
 
   // Имя провайдера для логов (например, "MusicBrainz", "Gemini" и т.д.)
   virtual const char* name() const = 0;
@@ -48,6 +57,10 @@ public:
 protected:
   String _apiKey;                              // API ключ (используется Gemini, DeepSeek, Last.fm)
   ProviderLanguage _language = ProviderLanguage::AUTO;  // Язык по умолчанию
+
+  // Общий текст user-промпта для AI (база + вариация для 2..N-го факта).
+  String makeMusicFactUserPrompt(const String& artist, const String& title,
+                                 const FactFetchContext* ctx) const;
 };
 
 #endif
