@@ -1,7 +1,7 @@
-# Облачная сборка прошивки (этап 1): один ref-env, без Worker / генератора.
-# Проверка: Actions → Run workflow → скачать artifact.
+# Облачная сборка прошивки: ref-env + опциональная подстановка myoptions (вариант C).
 # Flash-адреса (partitions.csv, N16R8): bootloader 0x0, partitions 0x8000,
 # boot_app0 0xE000, firmware 0x10000, littlefs 0x610000.
+# myoptions_b64: пусто = as-is из репо; иначе base64 текста → src/myoptions.h только на раннере (в git не коммитим).
 
 name: Build firmware
 
@@ -15,6 +15,11 @@ on:
         type: choice
         options:
           - yoradio-esp32s3
+      myoptions_b64:
+        description: "Опционально: base64 содержимого src/myoptions.h (из генератора). Пусто = файл из репо."
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -49,7 +54,47 @@ jobs:
           restore-keys: |
             pio-${{ runner.os }}-
 
-      # myoptions — as-is из репо (подстановка из генератора — этап 2/3).
+      # Подстановка myoptions: только через env (не ${{ inputs.* }} внутри run — иначе инъекция в shell).
+      # Лимит workflow_dispatch input ~64 KiB; sanity: размер и наличие #define.
+      - name: Apply myoptions from input (optional)
+        env:
+          MYOPTIONS_B64: ${{ inputs.myoptions_b64 }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${MYOPTIONS_B64}" ]]; then
+            echo "myoptions_b64 пуст — оставляем src/myoptions.h из репозитория"
+            exit 0
+          fi
+          python3 - <<'PY'
+          import base64, os, sys
+          raw = os.environ.get("MYOPTIONS_B64", "")
+          try:
+              text = base64.b64decode(raw, validate=True)
+          except Exception as e:
+              print(f"::error::myoptions_b64: невалидный base64 ({e})")
+              sys.exit(1)
+          if len(text) < 32:
+              print("::error::myoptions_b64: слишком короткий после decode")
+              sys.exit(1)
+          if len(text) > 48_000:
+              print(f"::error::myoptions_b64: слишком большой ({len(text)} байт), лимит 48000")
+              sys.exit(1)
+          try:
+              s = text.decode("utf-8")
+          except UnicodeDecodeError as e:
+              print(f"::error::myoptions_b64: не UTF-8 ({e})")
+              sys.exit(1)
+          if "#define" not in s:
+              print("::error::myoptions_b64: нет #define — не похоже на myoptions.h")
+              sys.exit(1)
+          path = "src/myoptions.h"
+          with open(path, "w", encoding="utf-8", newline="\n") as f:
+              f.write(s)
+              if not s.endswith("\n"):
+                  f.write("\n")
+          print(f"Записан {path}: {len(s)} символов UTF-8")
+          PY
+
       # Audio+fix (liblwip/libesp_netif) — через post:tools/patch_audio_fix_libs.py в platformio.ini.
       - name: Build firmware
         run: pio run -e "${{ inputs.profile }}"
