@@ -1,0 +1,116 @@
+# Облачная сборка прошивки (этап 1): один ref-env, без Worker / генератора.
+# Проверка: Actions → Run workflow → скачать artifact.
+# Flash-адреса (partitions.csv, N16R8): bootloader 0x0, partitions 0x8000,
+# boot_app0 0xE000, firmware 0x10000, littlefs 0x610000.
+
+name: Build firmware
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "PlatformIO env (этап 1 — один ref)"
+        required: true
+        default: "yoradio-esp32s3"
+        type: choice
+        options:
+          - yoradio-esp32s3
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: pio ${{ inputs.profile }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PlatformIO
+        run: pip install -U platformio
+
+      # Кэш тулчейна/пакетов — повторные сборки быстрее первой.
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/.cache
+            ~/.platformio/packages
+            ~/.platformio/platforms
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: |
+            pio-${{ runner.os }}-
+
+      # myoptions — as-is из репо (подстановка из генератора — этап 2/3).
+      # Audio+fix (liblwip/libesp_netif) — через post:tools/patch_audio_fix_libs.py в platformio.ini.
+      - name: Build firmware
+        run: pio run -e "${{ inputs.profile }}"
+
+      - name: Build LittleFS image
+        run: pio run -e "${{ inputs.profile }}" -t buildfs
+
+      - name: Pack flash images
+        env:
+          PIOENV: ${{ inputs.profile }}
+        run: |
+          set -euo pipefail
+          BUILD_DIR=".pio/build/${PIOENV}"
+          OUT_DIR="firmware-out"
+          mkdir -p "${OUT_DIR}"
+
+          # Обязательные бины из каталога сборки PIO
+          for f in bootloader.bin partitions.bin firmware.bin littlefs.bin; do
+            if [[ ! -f "${BUILD_DIR}/${f}" ]]; then
+              echo "::error::Нет ${BUILD_DIR}/${f}"
+              ls -la "${BUILD_DIR}" || true
+              exit 1
+            fi
+            cp -v "${BUILD_DIR}/${f}" "${OUT_DIR}/"
+          done
+
+          # boot_app0 @ 0xE000 — PIO кладёт в build dir или лежит в пакете framework
+          if [[ -f "${BUILD_DIR}/boot_app0.bin" ]]; then
+            cp -v "${BUILD_DIR}/boot_app0.bin" "${OUT_DIR}/"
+          else
+            BOOT_APP0="$(find "${HOME}/.platformio/packages" -type f -name 'boot_app0.bin' 2>/dev/null | head -n 1 || true)"
+            if [[ -z "${BOOT_APP0}" ]]; then
+              echo "::error::Не найден boot_app0.bin"
+              exit 1
+            fi
+            cp -v "${BOOT_APP0}" "${OUT_DIR}/boot_app0.bin"
+          fi
+
+          # Карта адресов для ручной прошивки / будущего esptool-js
+          {
+            echo "# Адреса flash (ESP32-S3 N16R8, partitions.csv проекта)"
+            echo "bootloader.bin  0x0000"
+            echo "partitions.bin  0x8000"
+            echo "boot_app0.bin   0xE000"
+            echo "firmware.bin    0x10000"
+            echo "littlefs.bin    0x610000"
+          } > "${OUT_DIR}/flash_map.txt"
+
+          echo "profile=${PIOENV}" > "${OUT_DIR}/build_info.txt"
+          echo "sha=${GITHUB_SHA}" >> "${OUT_DIR}/build_info.txt"
+          echo "run_id=${GITHUB_RUN_ID}" >> "${OUT_DIR}/build_info.txt"
+
+          ZIP_NAME="lstepMOD-${PIOENV}-${GITHUB_SHA:0:7}.zip"
+          (cd "${OUT_DIR}" && zip -9 "../${ZIP_NAME}" ./*)
+          echo "ZIP=${ZIP_NAME}" >> "${GITHUB_ENV}"
+          ls -la "${OUT_DIR}" "${ZIP_NAME}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ inputs.profile }}
+          path: lstepMOD-*.zip
+          if-no-files-found: error
+          retention-days: 14
