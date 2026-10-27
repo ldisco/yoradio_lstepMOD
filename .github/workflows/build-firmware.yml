@@ -9,12 +9,15 @@ on:
   workflow_dispatch:
     inputs:
       profile:
-        description: "PlatformIO env (этап 1 — один ref)"
+        description: "PlatformIO env (ESP32-S3 N16R8; wrover — later)"
         required: true
         default: "yoradio-esp32s3"
         type: choice
         options:
           - yoradio-esp32s3
+          - yoradio-jc2432w328
+          - yoradio-jc3248w535
+          - yoradio-4848s040
       myoptions_b64:
         description: "Опционально: base64 содержимого src/myoptions.h (из генератора). Пусто = файл из репо."
         required: false
